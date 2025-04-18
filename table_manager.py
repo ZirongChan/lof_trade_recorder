@@ -75,17 +75,21 @@ class TableManager(tk.Tk):
         self.sheet_count += 1
         sheet_name = f"Sheet {self.sheet_count}"
         
+        # 创建新的容器框架并配置布局
         frame = tk.Frame(self.notebook)
+
         self.notebook.add(frame, text=sheet_name)
-        
-        # 创建交易表单
+
+        # 创建交易表单时需要传递正确的父容器
         trade_sheet = TradeSheet(frame, self.headers, sheet_name)
         trade_sheet.pack(expand=True, fill='both')
+
+        trade_sheet.load_data()  # 确保加载默认行
 
         # dynamicly determine the height of table based on the sheet
         self.update_idletasks()
 
-         # 重点添加以下两行
+        # 将新表单添加到notebook
         self.notebook.select(len(self.notebook.tabs())-1)  # 切换到新建标签页
         self.notebook.event_generate("<<NotebookTabChanged>>")  # 触发标签切换事件
         
@@ -140,7 +144,6 @@ class TableManager(tk.Tk):
                     # Always create the sheet and let it decide if the data is valid
                     frame = tk.Frame(self.notebook)
                     trade_sheet = TradeSheet(frame, self.headers, sheet_name)
-                    trade_sheet.pack(expand=True, fill="both")
 
                     # If it loaded any data rows, count it as valid
                     if trade_sheet.rows:
@@ -157,6 +160,8 @@ class TableManager(tk.Tk):
                     else:
                         print(f"Sheet '{sheet_name}' has no valid rows — skipping tab.")
 
+                    trade_sheet.pack(expand=True, fill="both")
+                    
                 except Exception as e:
                     print(f"Error loading sheet '{sheet_name}': {e}")
 
@@ -185,7 +190,7 @@ class TableManager(tk.Tk):
             # 新增滚动条高度补偿（约20像素）
             scroll_compensation = 20 if sheet.has_vertical_scroll() else 0
             
-            # 更新窗口高度（保持当前宽度）
+            # 更新窗口高度（保持当前宽度
             total_height = control_height + sheet_height + scroll_compensation + 40
             self.geometry(f"{self.winfo_width()}x{total_height}")
             

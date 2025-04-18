@@ -26,11 +26,14 @@ class TradeSheet(tk.Frame):
             self._init_start = time.perf_counter()
         
         super().__init__(parent)
+
         self.headers = headers
         self.sheet_name = sheet_name
         self.rows = []
 
-        self.cell_width = 15 # 固定单元格宽度
+        self.cell_width = 12 # 固定单元格宽度
+
+        self._configure_style()
 
         # for the real-time trading price，初始化为0
         self.rt_price = 0
@@ -61,10 +64,15 @@ class TradeSheet(tk.Frame):
             
         # 在开始加载前暂停布局计算（新增）
         self.table_frame.grid_propagate(False)
-        self.canvas.pack_forget()
         
+        # 绘制顶部信息行
         self.draw_top_info_row()
-        self.load_data()
+
+        # 绘制表格
+        self.draw_table()
+
+        # 加载数据
+        self.load_data() # 此时数据行会添加到表头下方
         
         # 恢复布局计算（新增）
         self.table_frame.grid_propagate(True)
@@ -78,16 +86,23 @@ class TradeSheet(tk.Frame):
             self._init_loaded_done = time.perf_counter()
             print(f"数据加载耗时: {(self._init_loaded_done - self._init_loaded)*1000:.2f}ms")
 
-        self.draw_table()
         self.table_frame.update_idletasks()  # 恢复布局计算
 
+        # 更新实时交易价格
         self.update_price()
 
+        # 更新预测利润
         self.update_profits()
-
+    
     def _on_frame_configure(self, event):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.canvas.config(height=self.table_frame.winfo_reqheight())
+
+    def get_req_width(self):
+        # make sure all measurements are up to date
+        self.update_idletasks()
+        # width of the whole frame that holds your grid of headers+rows
+        return self.table_frame.winfo_reqwidth()
 
     def draw_table(self):
         for i, header in enumerate(self.headers):
@@ -277,7 +292,7 @@ class TradeSheet(tk.Frame):
         # 更新窗口尺寸
         root = self.winfo_toplevel()
         root.update_idletasks()
-        req_height = self.get_total_height() + self.master.master.control_frame.winfo_height() + 20
+        req_height = self.get_total_height() + root.control_frame.winfo_height() + 20
         root.geometry(f"{root.winfo_width()}x{max(req_height, 400)}")
 
     def has_vertical_scroll(self):
@@ -295,29 +310,32 @@ class TradeSheet(tk.Frame):
     def _configure_style(self):
         """配置 ttk 按钮样式"""
         self.style = ttk.Style()
-        button_width = len(self.headers) * self.cell_width // 4
+    
         # 定义样式名称，避免污染全局样式
         self.style.configure(
             "TradeSheet.TButton", 
             padding=2, 
-            width=button_width,
             font=("Arial", 9)
         )
 
     def render_add_button(self, row):
-        # 销毁旧按钮（如果存在）
-        if hasattr(self, 'add_top_btn'):
-            self.add_top_btn.destroy()
-        if hasattr(self, 'add_bottom_btn'):
-            self.add_bottom_btn.destroy()
-        if hasattr(self, 'delete_row_btn'):
-            self.delete_row_btn.destroy()
-        if hasattr(self, 'update_profits_btn'):
-            self.update_profits_btn.destroy()
+        # ——— 1) 删除旧按钮 ———
+        for attr in ('add_top_btn','add_bottom_btn','delete_row_btn','update_profits_btn'):
+            if hasattr(self, attr):
+                getattr(self, attr).destroy()
         
-        # 配置表格列均匀分布
-        for i in range(4):
-            self.table_frame.columnconfigure(i, weight=1, uniform="colgroup")
+        total_cols = len(self.headers)
+        # 计算每个按钮跨几列（向下取整）
+        base = total_cols // 4
+        rem = total_cols % 4
+
+        # 2) 计算每个按钮应跨越多少列
+        spans = [base + (1 if i < rem else 0) for i in range(4)]
+        # 当 total_cols=6 时，spans = [2,2,1,1]
+
+        # 3) 给所有列统一权重
+        for c in range(total_cols):
+            self.table_frame.columnconfigure(c, weight=1, uniform="btn_cols")
 
         # 创建4个按钮，水平排列
         self.add_top_btn = ttk.Button(
@@ -326,6 +344,7 @@ class TradeSheet(tk.Frame):
             command=self.add_row_on_top,  # 绑定到顶部添加方法
             style="TradeSheet.TButton"  # 应用自定义样式
         )
+
         self.add_bottom_btn = ttk.Button(
             self.table_frame, 
             text="↓ 底部追加 ↓", 
@@ -347,18 +366,14 @@ class TradeSheet(tk.Frame):
             style="TradeSheet.TButton"
         )
         
-        # 将按钮放在同一行，左右分布
-
-        self.add_top_btn.grid(row=row, column=0, columnspan=1, sticky="ew", pady=5)
-
-        self.add_bottom_btn.grid(row=row, column=1, columnspan=1, sticky="ew", pady=5)
-
-        self.delete_row_btn.grid(row=row, column=2, columnspan=1, sticky="ew", pady=5)
-
-        self.update_profits_btn.grid(row=row, column=3, columnspan=1, sticky="ew", pady=5)
-
-        # 新增最后一行
-        self.update_geometry()
+        # 5) 按照 spans 安排 grid 起始列
+        col = 0
+        for btn, span in zip((self.add_top_btn, self.add_bottom_btn, self.delete_row_btn, self.update_profits_btn), spans):
+            btn.grid(row=row, column=col, columnspan=span, sticky="ew", pady=5)
+            col += span
+    
+        # 6) 刷新布局
+        self.table_frame.update_idletasks()
 
     def update_result(self, row_index):
 
@@ -562,11 +577,13 @@ class TradeSheet(tk.Frame):
             with self.disable_redraw():
                 for _ in range(3):
                     self.add_row_on_bottom()
+
+            self.canvas.pack(side="left", fill="both", expand=True)
             return
     
         try:
     
-            self.canvas.pack_forget()
+            # self.canvas.pack_forget()
             with open(self.save_path, "r", encoding="utf-8") as f:
                 saved_data = json.load(f)
     
@@ -614,6 +631,10 @@ class TradeSheet(tk.Frame):
     
             # 异常处理后也需要渲染按钮
             self.render_add_button(len(self.rows) + 2)
+
+            # 确保在异常处理后显示Canvas
+            self.canvas.pack(side="left", fill="both", expand=True)
+            self.canvas.update_idletasks()
     
     # 新增上下文管理器用于批量操作（添加）
     def disable_redraw(self):
@@ -645,7 +666,7 @@ class TradeSheet(tk.Frame):
         self.top_slot2.grid(row=0, column=1, columnspan=3, sticky="nsew")  # 占用2列
         
         # 实时价格部分（占用后2列）
-        self.top_slot3 = tk.Label(self.table_frame, text="场内实时成交价格",
+        self.top_slot3 = tk.Label(self.table_frame, text="场内成交价",
                                 width=self.cell_width, anchor='center')
         self.top_slot3.grid(row=0, column=4, columnspan=1, sticky="nsew")  # 占用1列
         
@@ -657,12 +678,6 @@ class TradeSheet(tk.Frame):
             self.add_button.update_idletasks()  # Ensure it’s been drawn
             return self.add_button.winfo_reqheight()
         return 0
-    
-    def get_total_height(self):
-        self.update_idletasks()
-        base_height = self.table_frame.winfo_reqheight()
-        button_height = self.get_add_button_height()
-        return base_height + button_height + 99  # extra margin
 
     def highlight_selected_row(self, widget):
         # 先重置所有行的背景色
