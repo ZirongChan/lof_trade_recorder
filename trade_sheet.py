@@ -420,7 +420,7 @@ class TradeSheet(tk.Frame):
                 row[1].insert(0, net_value)
             else:
                 # tk.messagebox.showerror("错误", f"{date_str} 无净值数据！")
-                print("错误", f"{date_str} 无净值数据！")
+                print("错误", f"{date_str} 无净值数据 for {fund_code}！\n")
                 return
             
             # trading operations
@@ -473,12 +473,34 @@ class TradeSheet(tk.Frame):
                 print(f"Invalid LOF code given, plz check and re-try.\n")
                 return
 
-            # fetch real-time price via xalpha
-            latest_price = xalpha_tool.fetch_realtime_market_price(fund_code)
+            # # fetch real-time price via xalpha
+            # latest_price = xalpha_tool.fetch_realtime_market_price(fund_code)
+            # self.rt_price = latest_price
 
-            self.rt_price = latest_price
-            self.top_slot4.delete(0, tk.END)
-            self.top_slot4.insert(0, str(latest_price))
+            # # show the price in the top_slot4
+            # self.top_slot4.delete(0, tk.END)
+            # self.top_slot4.insert(0, str(latest_price))
+
+            # alternatively, show the percentage as well
+            latest_info = xalpha_tool.fetch_realtime_stock_info(fund_code)
+            if latest_info is not None:
+                percentage = latest_info["percent"]
+
+                latest_price = latest_info["current"]
+                self.rt_price = latest_price
+
+                # if latest_info['market'] is not None:
+                #     print(latest_info['market'])
+
+                self.top_slot4.delete(0, tk.END)
+                self.top_slot4.insert(0, str(latest_price))
+
+                self.top_slot5.delete(0, tk.END)
+                self.top_slot5.insert(0, f"{percentage}%")
+                if percentage > 0:
+                    self.top_slot5.configure(fg="red")
+                else:
+                    self.top_slot5.configure(fg="green")
 
         except Exception as e:
             print("Price update failed:", e)
@@ -573,6 +595,8 @@ class TradeSheet(tk.Frame):
             # 初始化空数据和默认行
             self.top_slot2.insert(0, "")
             self.top_slot4.insert(0, "")
+            self.top_slot5.insert(0, "")
+
             # 使用批量添加模式
             with self.disable_redraw():
                 for _ in range(3):
@@ -605,6 +629,8 @@ class TradeSheet(tk.Frame):
             
             self.top_slot4.delete(0, tk.END)
             self.top_slot4.insert(0, top_info.get("real_time_price", ""))
+
+            self.top_slot5.delete(0, tk.END)
     
             # 使用批量加载模式（优化点）
             with self.disable_redraw():
@@ -625,6 +651,7 @@ class TradeSheet(tk.Frame):
             # 失败时初始化空数据（关键异常处理保留）
             self.top_slot2.delete(0, tk.END)
             self.top_slot4.delete(0, tk.END)
+            self.top_slot5.delete(0, tk.END)
             with self.disable_redraw():
                 for _ in range(3):
                     self.add_row_on_bottom()
@@ -657,22 +684,28 @@ class TradeSheet(tk.Frame):
         for i in range(total_columns):
             self.table_frame.columnconfigure(i, weight=1, uniform="colgroup")
         
-        # 基金名称部分（占用前4列）
+        # 基金名称部分（占用前3列）
         self.top_slot1 = tk.Label(self.table_frame, text="基金名称", 
                                 width=self.cell_width, anchor='center')
         self.top_slot1.grid(row=0, column=0, columnspan=1, sticky="nsew")
         
         self.top_slot2 = tk.Entry(self.table_frame, width=self.cell_width*2, justify="center", fg="blue")
-        self.top_slot2.grid(row=0, column=1, columnspan=3, sticky="nsew")  # 占用2列
+        self.top_slot2.grid(row=0, column=1, columnspan=2, sticky="nsew")  # 占用2列
         
-        # 实时价格部分（占用后2列）
+        # 实时价格部分（占用后3列）
+        # 标题
         self.top_slot3 = tk.Label(self.table_frame, text="场内成交价",
                                 width=self.cell_width, anchor='center')
-        self.top_slot3.grid(row=0, column=4, columnspan=1, sticky="nsew")  # 占用1列
+        self.top_slot3.grid(row=0, column=3, columnspan=1, sticky="nsew")  # 占用1列
         
+        # 价格
         self.top_slot4 = tk.Entry(self.table_frame, width=self.cell_width, justify="center", fg="blue")
-        self.top_slot4.grid(row=0, column=5, columnspan=1, sticky="nsew")  # 占用1列
+        self.top_slot4.grid(row=0, column=4, columnspan=1, sticky="nsew")  # 占用1列
     
+        # 百分比
+        self.top_slot5 = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
+        self.top_slot5.grid(row=0, column=5, columnspan=1, sticky="nsew")  # 占用1列
+
     def get_add_button_height(self):
         if hasattr(self, "add_button"):
             self.add_button.update_idletasks()  # Ensure it’s been drawn

@@ -83,9 +83,21 @@ def fetch_realtime_market_price(code):
         # market_price = xa.get_rt(code)  # 市价（需配置数据源）
         # premium = (market_price - nav) / nav * 100  # 溢价率
 
+# 场内交易的基金的最新价格 以及 涨跌百分比
+# market_price = stock_info['current']
+# change_percentage = stock_info['change_percentage']
+
+def fetch_realtime_stock_info(code):
+    try:
+        stock_info = xa.get_rt(code)
+
+        return stock_info
+    except Exception as e:
+        return None
+
 def get_fund_name(code):
     try:
-        fund = xa.fundinfo(code)        
+        fund = xa.fundinfo(code)
         return fund.name
 
     except Exception as e:

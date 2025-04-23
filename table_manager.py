@@ -164,6 +164,9 @@ class TableManager(tk.Tk):
                     
                 except Exception as e:
                     print(f"Error loading sheet '{sheet_name}': {e}")
+            
+            # debug with only one sheet loaded
+            # break
 
         # If no valid sheets were loaded, create a blank one
         if valid_sheets == 0:
