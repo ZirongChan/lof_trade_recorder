@@ -178,6 +178,3 @@ def changnei_shengou(code, money_amount, date):
 
     except Exception as e:
         return None
-
-def calculate_result():
-    aa = 1
