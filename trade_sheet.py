@@ -150,8 +150,13 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "0")
 
-                cell.bind("<Return>", self.handle_entry_return)
+                # 原本的实现，entry控件绑定的行号没有动态更新
+                # 增或减一行时，行号不会更新，导致update_result()的输入行号错误
                 # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
+                
+                # 修改后，按下回车或者鼠标移到其他位置，即可尝试更新整行数据
+                cell.bind("<Return>", self.handle_entry_return)
+                cell.bind("<FocusOut>", self.handle_entry_return)
                 
                 # 新增：绑定当前行高亮
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
@@ -162,9 +167,9 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "-")
 
+                # 修改后，按下回车或者鼠标移到其他位置，即可尝试更新整行数据
                 cell.bind("<Return>", self.handle_entry_return)
-                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
+                cell.bind("<FocusOut>", self.handle_entry_return)
 
                 # 新增：绑定当前行高亮
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
@@ -208,8 +213,6 @@ class TradeSheet(tk.Frame):
                     cell.set_date(prefill[header])
                 
                 cell.bind("<Return>", self.handle_entry_return)
-                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
 
                 # 新增：绑定当前行高亮
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
@@ -221,10 +224,10 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "0")
 
+                # 修改后，按下回车或者鼠标移到其他位置，即可尝试更新整行数据
                 cell.bind("<Return>", self.handle_entry_return)
-                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
-                
+                cell.bind("<FocusOut>", self.handle_entry_return)
+                                
                 # 新增：绑定当前行高亮
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
             else:
@@ -232,11 +235,11 @@ class TradeSheet(tk.Frame):
                 if prefill and header in prefill:
                     cell.insert(0, prefill[header])
 
+                # 修改后，按下回车或者鼠标移到其他位置，即可尝试更新整行数据
                 cell.bind("<Return>", self.handle_entry_return)
-                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
+                cell.bind("<FocusOut>", self.handle_entry_return)
 
-                # 新增：绑定当前行高亮
+                # 新增：绑定当前行高亮 
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
 
             cell.grid(row=row_index, column=col_index, sticky="nsew")
