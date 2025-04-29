@@ -136,8 +136,12 @@ class TradeSheet(tk.Frame):
                 if prefill and header in prefill:
                     cell.set_date(prefill[header])
 
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
                 # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
+
+                # 新增：绑定当前行高亮
+                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
 
             elif header == "Sub. in Currency" or header == "申购金额":
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify='center')
@@ -146,9 +150,11 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "0")
 
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
+                
+                # 新增：绑定当前行高亮
                 cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
-
             else:
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify='center')
                 if prefill and header in prefill:
@@ -156,10 +162,13 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "-")
 
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
                 # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
 
+                # 新增：绑定当前行高亮
+                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
+            
             cell.grid(row=row_index, column=col_index, sticky="nsew")
             row_widgets.append(cell)
 
@@ -197,9 +206,13 @@ class TradeSheet(tk.Frame):
                 cell = DateEntry(self.table_frame, width=self.cell_width, date_pattern='yyyy-mm-dd', justify = 'center')
                 if prefill and header in prefill:
                     cell.set_date(prefill[header])
-
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
+                
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
                 # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
+
+                # 新增：绑定当前行高亮
+                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
 
             elif header == "Sub. in Currency" or header == "申购金额":
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify='center')
@@ -208,24 +221,36 @@ class TradeSheet(tk.Frame):
                 else:
                     cell.insert(0, "0")
 
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
                 # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
-
+                
+                # 新增：绑定当前行高亮
+                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
             else:
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify='center')
                 if prefill and header in prefill:
                     cell.insert(0, prefill[header])
 
-                cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
-                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
+                cell.bind("<Return>", self.handle_entry_return)
+                # cell.bind("<Return>", lambda e, r=row_index: self.update_result(r))
                 # cell.bind("<FocusOut>", lambda e, r=row_index: self.update_result(r))
+
+                # 新增：绑定当前行高亮
+                cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
 
             cell.grid(row=row_index, column=col_index, sticky="nsew")
             row_widgets.append(cell)
 
         self.rows.insert(0, row_widgets) # insert in the first row
         self.render_add_button(len(self.rows) + 2) # shift the add_button down by one row
+
+    # 在 TradeSheet 类中添加新的处理方法
+    def handle_entry_return(self, event):
+        """动态获取当前行号并更新结果"""
+        widget = event.widget
+        row = widget.grid_info()["row"]  # 获取控件所在的实际行号
+        self.update_result(row)
 
     def delete_selected_row(self):
         # 检查是否有行被选中
@@ -419,7 +444,6 @@ class TradeSheet(tk.Frame):
                 # print("date matches.\n")
                 row[1].insert(0, net_value)
             else:
-                # tk.messagebox.showerror("错误", f"{date_str} 无净值数据！")
                 print("错误", f"{date_str} 无净值数据 for {fund_code}！\n")
                 return
             
