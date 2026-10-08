@@ -103,7 +103,7 @@ def get_fund_name(code):
     except Exception as e:
         return None
 
-def changnei_shengou_xalpha(code, money_amount, date):
+def subscribe_xalpha(code, money_amount, date):
     try:
         fund = xa.fundinfo(code)
 
@@ -124,7 +124,7 @@ def changnei_shengou_xalpha(code, money_amount, date):
     except Exception as e:
         return None
 
-def changnei_shengou(code, money_amount, date):
+def subscribe(code, money_amount, date):
     try:
         fund = xa.fundinfo(code)
 

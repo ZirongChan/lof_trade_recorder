@@ -15,9 +15,21 @@ class TableManager(tk.Tk):
         
         # App title
         self.title("LOF套利记账本")
+        self.geometry("1300x600")
+        self.minsize(1200, 500)
         
         # create headers
-        self.headers = ["日期", "净值", "申购金额", "到账份额", "申购成本/份", "预估利润"]
+        self.headers = [
+            "日期",
+            "净值",
+            "申购金额",
+            "到账份额",
+            "申购成本/份",
+            "预估利润",
+            "至今涨幅",
+            "卖出份额",
+            "满7日剩余",
+        ]
 
         # redemption: 赎回 in share
 
@@ -80,13 +92,10 @@ class TableManager(tk.Tk):
 
         self.notebook.add(frame, text=sheet_name)
 
-        # 创建交易表单时需要传递正确的父容器
+        # 创建交易表单时需要传递正确的父容器（TradeSheet.__init__ 内已 load_data）
         trade_sheet = TradeSheet(frame, self.headers, sheet_name)
         trade_sheet.pack(expand=True, fill='both')
 
-        trade_sheet.load_data()  # 确保加载默认行
-
-        # dynamicly determine the height of table based on the sheet
         self.update_idletasks()
 
         # 将新表单添加到notebook
@@ -174,31 +183,13 @@ class TableManager(tk.Tk):
             self.add_new_sheet()
        
     def on_tab_change(self, event):
-        current_tab = self.notebook.select()
-        if not current_tab: 
-            return
-        
-        sheet_name = self.notebook.tab(current_tab, "text")
-        sheet = self.sheets.get(sheet_name)
-        
-        if sheet:
-            # 强制更新布局计算
-            self.update_idletasks()
-            sheet.update_idletasks()
-            
-            # 计算总高度 = 控制栏高度 + 表格实际高度 + 安全边距
-            control_height = self.control_frame.winfo_height()
-            sheet_height = sheet.winfo_reqheight()
-            
-            # 新增滚动条高度补偿（约20像素）
-            scroll_compensation = 20 if sheet.has_vertical_scroll() else 0
-            
-            # 更新窗口高度（保持当前宽度
-            total_height = control_height + sheet_height + scroll_compensation + 40
-            self.geometry(f"{self.winfo_width()}x{total_height}")
-            
-            # 设置最小高度保证按钮可见
-            self.minsize(800, 400)
+        # 固定最小窗口；表格在 sheet 内滚动，不再随行数无限拉高
+        self.minsize(1200, 500)
+        self.update_idletasks()
+        width = max(self.winfo_width(), 1200)
+        height = max(self.winfo_height(), 500)
+        if self.winfo_width() < 1200 or self.winfo_height() < 500:
+            self.geometry(f"{width}x{height}")
 
     def delete_current_sheet(self):
         # 获取当前选中的标签页
