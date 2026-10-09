@@ -7,7 +7,6 @@ from tkinter import ttk
 from tkcalendar import DateEntry
 
 from datetime import datetime, timedelta
-import calendar
 
 import xalpha_tool
 
@@ -15,8 +14,8 @@ DEBUG_TIMING = False
 
 # Grid layout: row 0 = headers, row 1+ = data (top info is outside the table)
 DATA_GRID_OFFSET = 1
-HISTORY_MONTHS = 3
-FALLBACK_VISIBLE_ROWS = 3
+# Canvas 尚未布局完成时的可见行数回退值
+FALLBACK_VISIBLE_ROWS = 8
 
 
 class TradeSheet(tk.Frame):
@@ -33,6 +32,7 @@ class TradeSheet(tk.Frame):
         self.rt_price = 0
         self.profit_col_index = self.headers.index("预估利润")
         self.gain_col_index = self.headers.index("至今涨幅")
+        self.buy_col_index = self.headers.index("买入份额")
         self.sell_col_index = self.headers.index("卖出份额")
         self.mature_col_index = self.headers.index("满7日剩余")
         self.selected_row_indices = set()
@@ -42,6 +42,8 @@ class TradeSheet(tk.Frame):
         self._full_rows_data = []
         self._hidden_rows_data = []
         self._history_collapsed = True
+        self._refitting = False
+        self._fit_after_id = None
         self.is_qdii_var = tk.BooleanVar(value=False)
 
         self._configure_style()
@@ -96,6 +98,14 @@ class TradeSheet(tk.Frame):
 
     def _on_canvas_configure(self, event):
         self.canvas.itemconfigure(self.canvas_window, width=event.width)
+        # 折叠态下按可视高度重算「更多交易」
+        if self._history_collapsed and not self._batch_loading and not self._refitting:
+            if self._fit_after_id is not None:
+                try:
+                    self.after_cancel(self._fit_after_id)
+                except Exception:
+                    pass
+            self._fit_after_id = self.after(120, self._refit_history_to_viewport)
 
     def _bind_mousewheel(self, event):
         self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -185,12 +195,12 @@ class TradeSheet(tk.Frame):
             self.save_data()
 
     def _is_input_header(self, header):
-        return header in ("Date", "日期", "Sub. in Currency", "申购金额", "卖出份额")
+        return header in ("Date", "日期", "Sub. in Currency", "申购金额", "买入份额", "卖出份额")
 
     def _bind_row_cell(self, cell, header):
         cell.bind("<Button-1>", self._on_cell_button1, add="+")
         cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
-        if header == "卖出份额":
+        if header in ("买入份额", "卖出份额"):
             cell.bind("<Return>", self.handle_sell_return)
             cell.bind("<FocusOut>", self.handle_sell_return)
         elif self._is_input_header(header):
@@ -207,18 +217,21 @@ class TradeSheet(tk.Frame):
                     date_pattern="yyyy-mm-dd",
                     justify="center",
                 )
+                default_day = self.latest_trading_day()
                 if prefill and header in prefill:
                     try:
                         cell.set_date(prefill[header])
                     except Exception:
-                        pass
+                        cell.set_date(default_day)
+                else:
+                    cell.set_date(default_day)
             elif header in ("Sub. in Currency", "申购金额"):
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
                 if prefill and header in prefill:
                     cell.insert(0, prefill[header])
                 else:
                     cell.insert(0, "0")
-            elif header == "卖出份额":
+            elif header in ("买入份额", "卖出份额"):
                 cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
                 if prefill and header in prefill and str(prefill[header]).strip() not in ("", "-"):
                     cell.insert(0, prefill[header])
@@ -255,34 +268,23 @@ class TradeSheet(tk.Frame):
             entry.configure(state="readonly")
 
     def add_row_on_bottom(self, prefill=None):
-        if prefill is None and self.rows:
-            last_row = self.rows[-1]
-            prefill = {}
-            try:
-                prev_date = last_row[0].get_date()
-                prefill["日期"] = (prev_date + timedelta(days=-1)).strftime("%Y-%m-%d")
-            except Exception as e:
-                print("Could not parse previous date:", e)
+        if prefill is None:
+            prefill = {"日期": self.latest_trading_day().strftime("%Y-%m-%d")}
 
         grid_row = len(self.rows) + DATA_GRID_OFFSET
         row_widgets = self._make_row_widgets(grid_row, prefill=prefill)
         self.rows.append(row_widgets)
 
         if not self._batch_loading:
+            self._fold_overflow_into_hidden()
             self.render_action_buttons()
             self._recompute_lot_state()
             self.save_data()
             self.canvas.yview_moveto(1.0)
 
     def add_row_on_top(self, prefill=None):
-        if prefill is None and self.rows:
-            first_row = self.rows[0]
-            prefill = {}
-            try:
-                prev_date = first_row[0].get_date()
-                prefill["日期"] = (prev_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            except Exception as e:
-                print("Could not parse previous date:", e)
+        if prefill is None:
+            prefill = {"日期": self.latest_trading_day().strftime("%Y-%m-%d")}
 
         # Shift existing data rows down by one grid index
         for i, existing_row in enumerate(self.rows):
@@ -293,6 +295,7 @@ class TradeSheet(tk.Frame):
         self.rows.insert(0, row_widgets)
 
         if not self._batch_loading:
+            self._fold_overflow_into_hidden()
             self.render_action_buttons()
             self._recompute_lot_state()
             self.save_data()
@@ -366,6 +369,8 @@ class TradeSheet(tk.Frame):
                 )
 
         self._refresh_selection_highlight()
+        if self._history_collapsed and self._hidden_rows_data:
+            self._refit_history_to_viewport()
         self.render_action_buttons()
         self.update_profits()
         self._recompute_lot_state()
@@ -432,14 +437,108 @@ class TradeSheet(tk.Frame):
     def render_add_button(self, row=None):
         self.render_action_buttons()
 
-    def update_result(self, row_index):
+    def _date_str_from_cell(self, date_cell):
+        try:
+            if isinstance(date_cell, DateEntry):
+                return date_cell.get_date().strftime("%Y-%m-%d")
+            raw = date_cell.get().strip() if hasattr(date_cell, "get") else str(date_cell).strip()
+            return raw[:10] if raw else ""
+        except Exception:
+            return ""
+
+    def _parse_buy_money(self, raw):
+        text = (raw or "").strip()
+        if text in ("", "-"):
+            return 0.0
+        return float(text)
+
+    def _write_cell(self, cell, value):
+        if isinstance(cell, DateEntry):
+            try:
+                cell.set_date(value)
+            except Exception:
+                pass
+            return
+        was_readonly = str(cell.cget("state")) == "readonly"
+        cell.configure(state="normal")
+        cell.delete(0, tk.END)
+        cell.insert(0, "" if value is None else str(value))
+        if was_readonly:
+            cell.configure(state="readonly")
+
+    def _calc_subscription_fields(self, fund_code, date_str, buy_money_amount):
+        """按申购金额计算净值/到账/成本/买入份额。金额≤0 时清空申购字段，仍尽量取净值。"""
+        result = {
+            "nav": None,
+            "shares": None,
+            "cost": None,
+            "buy_shares": "0",
+            "error": None,
+        }
+        if not date_str:
+            result["error"] = "empty date"
+            return result
+
+        if buy_money_amount <= 0:
+            # 无申购：清空到账/成本/买入；净值仍拉取供「至今涨幅」
+            nav = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
+            result["nav"] = nav
+            result["shares"] = "-"
+            result["cost"] = "-"
+            result["buy_shares"] = "0"
+            return result
+
+        buy_res = xalpha_tool.subscribe(fund_code, buy_money_amount, date_str)
+        if buy_res is None:
+            # 回退只查净值，便于区分「无净值」与「申购计算失败」
+            nav = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
+            result["nav"] = nav
+            if nav is None:
+                result["error"] = f"{date_str} 无净值数据 for {fund_code}"
+            else:
+                result["error"] = f"subscribe failed for {fund_code} @ {date_str}"
+            return result
+
+        result["nav"] = buy_res.get("net_value")
+        if result["nav"] is None:
+            result["nav"] = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
+        shares = buy_res["share_amount_bought"]
+        result["shares"] = shares
+        result["cost"] = buy_res["cost_per_share"]
+        result["buy_shares"] = shares
+        return result
+
+    def _apply_calc_to_row_widgets(self, row, calc):
+        if calc["nav"] is not None:
+            self._write_cell(row[1], calc["nav"])
+        if calc["shares"] is not None:
+            self._write_cell(row[3], calc["shares"])
+        if calc["cost"] is not None:
+            self._write_cell(row[4], calc["cost"])
+        if calc["buy_shares"] is not None:
+            self._write_cell(row[self.buy_col_index], calc["buy_shares"])
+
+    def _apply_calc_to_row_data(self, row_data, calc):
+        expected = len(self.headers)
+        while len(row_data) < expected:
+            row_data.append("-")
+        if calc["nav"] is not None:
+            row_data[1] = str(calc["nav"])
+        if calc["shares"] is not None:
+            row_data[3] = str(calc["shares"])
+        if calc["cost"] is not None:
+            row_data[4] = str(calc["cost"])
+        if calc["buy_shares"] is not None:
+            row_data[self.buy_col_index] = str(calc["buy_shares"])
+
+    def update_result(self, row_index, save=True):
         row_index_in_list = row_index - DATA_GRID_OFFSET
         if row_index_in_list < 0 or row_index_in_list >= len(self.rows):
             return
         row = self.rows[row_index_in_list]
 
         try:
-            date_str = row[0].get()
+            date_str = self._date_str_from_cell(row[0])
             fund_code = self.sheet_name
 
             if len(fund_code) != 6 or not fund_code.isdigit():
@@ -447,51 +546,64 @@ class TradeSheet(tk.Frame):
                 self._recompute_lot_state()
                 return
 
-            buy_money_raw = row[2].get().strip()
             try:
-                buy_money_amount = float(buy_money_raw) if buy_money_raw not in ("", "-") else 0.0
+                buy_money_amount = self._parse_buy_money(row[2].get())
             except ValueError:
                 print("money amount for buying is not right, plz check and re-try.\n")
                 return
 
-            # Sell-only day: no subscription network call
-            if buy_money_amount <= 0:
-                self._recompute_lot_state()
-                if not self._batch_loading:
-                    self.save_data()
+            calc = self._calc_subscription_fields(fund_code, date_str, buy_money_amount)
+            if calc["error"] and buy_money_amount > 0:
+                print(f"错误: {calc['error']}！\n")
+                # 金额>0 但失败时不改写到账/成本，避免把旧正确值清掉；若拿到了净值仍写入
+                if calc["nav"] is not None:
+                    self._write_cell(row[1], calc["nav"])
+                self.update_profit_cell(row)
                 return
 
-            net_value = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
-            if net_value is None:
-                print(f"错误: {date_str} 无净值数据 for {fund_code}！\n")
-                return
-
-            buy_res = xalpha_tool.subscribe(fund_code, buy_money_amount, date_str)
-            if buy_res is None:
-                print(f"Error: subscribe failed for row {row_index}")
-                return
-
-            # Only rewrite computed cells after both fetches succeed
-            row[1].delete(0, tk.END)
-            row[1].insert(0, net_value)
-            row[3].delete(0, tk.END)
-            row[3].insert(0, buy_res["share_amount_bought"])
-            row[4].delete(0, tk.END)
-            row[4].insert(0, buy_res["cost_per_share"])
-
+            self._apply_calc_to_row_widgets(row, calc)
             self.update_profit_cell(row)
             self._recompute_lot_state()
-            if not self._batch_loading:
+            if save and not self._batch_loading:
                 self.save_data()
 
         except Exception as e:
             print(f"Error calculating result for row {row_index}: {e}")
 
-    def update_all_results(self):
+    def update_all_results(self, save=True):
         for i in range(DATA_GRID_OFFSET, len(self.rows) + DATA_GRID_OFFSET):
-            self.update_result(i)
+            self.update_result(i, save=False)
+        if save and not self._batch_loading:
+            self.save_data()
+
+    def _refresh_hidden_subscription_rows(self):
+        """折叠中的行也按申购金额重算，避免展开后仍是旧的「-」。"""
+        if not self._hidden_rows_data:
+            return
+        fund_code = self.sheet_name
+        if len(fund_code) != 6 or not fund_code.isdigit():
+            return
+        for row in self._hidden_rows_data:
+            normalized = self._normalize_row(row)
+            if normalized is None:
+                continue
+            row[:] = normalized
+            date_str = str(row[0])[:10]
+            try:
+                buy_money_amount = self._parse_buy_money(str(row[2]))
+            except ValueError:
+                continue
+            calc = self._calc_subscription_fields(fund_code, date_str, buy_money_amount)
+            if calc["error"] and buy_money_amount > 0:
+                if calc["nav"] is not None:
+                    row[1] = str(calc["nav"])
+                continue
+            self._apply_calc_to_row_data(row, calc)
 
     def refresh_derived_metrics(self):
+        # 重新拉净值并重算申购（含金额=0 时清空到账份额），再刷利润/涨幅/满7日
+        self.update_all_results(save=False)
+        self._refresh_hidden_subscription_rows()
         self.update_profits()
         self._recompute_lot_state()
         if not self._batch_loading:
@@ -553,10 +665,11 @@ class TradeSheet(tk.Frame):
 
     def destroy(self):
         self._unbind_mousewheel(None)
-        for attr in ("_timer_id", "_clock_timer_id"):
-            if hasattr(self, attr):
+        for attr in ("_timer_id", "_clock_timer_id", "_fit_after_id"):
+            timer_id = getattr(self, attr, None)
+            if timer_id is not None:
                 try:
-                    self.after_cancel(getattr(self, attr))
+                    self.after_cancel(timer_id)
                 except Exception:
                     pass
         super().destroy()
@@ -633,9 +746,10 @@ class TradeSheet(tk.Frame):
 
         today = datetime.now().date()
         confirm_n = 2 if self.is_qdii_var.get() else 1
+        buy_i = self.buy_col_index
         sell_i = self.sell_col_index
         mature_i = self.mature_col_index
-        share_i = 3
+        credited_i = 3  # 到账份额（兼容旧数据回退）
 
         indexed = list(enumerate(self._full_rows_data))
         indexed.sort(
@@ -649,12 +763,11 @@ class TradeSheet(tk.Frame):
         results = {}
 
         for orig_i, row in indexed:
-            # Ensure row width
-            while len(row) < len(self.headers):
-                if len(row) == 7:
-                    row.append("0")
-                else:
-                    row.append("-")
+            normalized = self._normalize_row(row)
+            if normalized is None:
+                results[orig_i] = "-"
+                continue
+            row[:] = normalized
 
             as_of = self._parse_row_date(row)
             if as_of is None:
@@ -673,7 +786,9 @@ class TradeSheet(tk.Frame):
                         lot["remain"] -= take
                         remaining_sell -= take
 
-            bought = self.safe_float(row[share_i])
+            bought = self.safe_float(row[buy_i])
+            if bought <= 0:
+                bought = self.safe_float(row[credited_i])
             if bought > 0:
                 confirm = self.add_trading_days(as_of, confirm_n)
                 lots.append({"confirm": confirm, "remain": bought})
@@ -718,14 +833,12 @@ class TradeSheet(tk.Frame):
             json.dump(data, f, indent=2, ensure_ascii=False)
 
     @staticmethod
-    def _months_ago(from_date, months):
-        year = from_date.year
-        month = from_date.month - months
-        while month <= 0:
-            month += 12
-            year -= 1
-        day = min(from_date.day, calendar.monthrange(year, month)[1])
-        return from_date.replace(year=year, month=month, day=day)
+    def latest_trading_day(from_date=None):
+        """最新交易日：当天若为工作日则用之，否则回退到上一周五（不含法定节假日）。"""
+        d = from_date or datetime.now().date()
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
 
     @staticmethod
     def _parse_row_date(row_data):
@@ -734,21 +847,150 @@ class TradeSheet(tk.Frame):
         except Exception:
             return None
 
+    def _header_height_px(self):
+        for child in self.table_frame.grid_slaves(row=0):
+            h = child.winfo_height()
+            if h > 1:
+                return h
+            req = child.winfo_reqheight()
+            if req > 1:
+                return req
+        return 28
+
+    def _data_row_height_px(self):
+        if self.rows:
+            cell = self.rows[0][0]
+            h = cell.winfo_height()
+            if h > 1:
+                return h
+            req = cell.winfo_reqheight()
+            if req > 1:
+                return req
+        return 26
+
+    def _max_visible_rows(self):
+        """当前 canvas 高度内能完整放下的数据行数（不含表头）。"""
+        self.update_idletasks()
+        canvas_h = int(self.canvas.winfo_height())
+        if canvas_h <= 1:
+            return FALLBACK_VISIBLE_ROWS
+        row_h = max(self._data_row_height_px(), 20)
+        header_h = max(self._header_height_px(), 20)
+        avail = canvas_h - header_h
+        if avail < row_h:
+            return 1
+        return max(1, avail // row_h)
+
+    def _extract_one_row_data(self, row_widgets):
+        row_data = []
+        for cell in row_widgets:
+            if isinstance(cell, DateEntry):
+                val = cell.get_date().strftime("%Y-%m-%d")
+            elif isinstance(cell, (tk.Entry, ttk.Combobox)):
+                val = cell.get()
+            elif isinstance(cell, tk.Label):
+                val = cell["text"]
+            else:
+                val = ""
+            row_data.append(val)
+        return row_data
+
+    def _fold_overflow_into_hidden(self):
+        """折叠态下：超出可视容量的底部行收入「更多交易」。"""
+        if not self._history_collapsed or self._batch_loading or self._refitting:
+            return
+        cap = self._max_visible_rows()
+        folded = False
+        while len(self.rows) > cap:
+            row_widgets = self.rows.pop()
+            row_data = self._extract_one_row_data(row_widgets)
+            for widget in row_widgets:
+                widget.destroy()
+            self._hidden_rows_data.insert(0, row_data)
+            folded = True
+        if folded:
+            self.selected_row_indices = {
+                i for i in self.selected_row_indices if i < len(self.rows)
+            }
+            if self._anchor_row_index is not None and self._anchor_row_index >= len(self.rows):
+                self._anchor_row_index = None
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _refit_history_to_viewport(self):
+        """按当前窗口高度重算可见/隐藏行（仅折叠态）。"""
+        self._fit_after_id = None
+        if self._batch_loading or not self._history_collapsed or self._refitting:
+            return
+        if not self.winfo_exists():
+            return
+
+        self._refitting = True
+        try:
+            self._sync_full_from_ui()
+            full = [list(r) for r in self._full_rows_data]
+            if not full:
+                return
+
+            cap = self._max_visible_rows()
+            visible = full[:cap]
+            hidden = full[cap:]
+
+            if len(visible) == len(self.rows) and len(hidden) == len(self._hidden_rows_data):
+                return
+
+            self._batch_loading = True
+            try:
+                self._clear_data_rows()
+                self._hidden_rows_data = [list(r) for r in hidden]
+                # 保持折叠策略，便于之后溢出自动收入「更多」
+                self._history_collapsed = True
+                for row in visible:
+                    prefill = dict(zip(self.headers, row))
+                    self.add_row_on_bottom(prefill=prefill)
+                self._full_rows_data = visible + self._hidden_rows_data
+            finally:
+                self._batch_loading = False
+
+            self.render_action_buttons()
+            self.update_profits()
+            self._recompute_lot_state()
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            self.canvas.yview_moveto(0.0)
+        finally:
+            self._refitting = False
+
     def _normalize_row(self, row):
-        """Pad legacy 6/7/8-col rows up to current header width."""
+        """Pad/migrate legacy rows up to current 10-col header width."""
         if not isinstance(row, list):
             return None
         expected = len(self.headers)
         if len(row) > expected:
             return None
         out = list(row)
+
+        def _buy_from_credited(cols):
+            if len(cols) > 3 and str(cols[3]).strip() not in ("", "-"):
+                return str(cols[3]).strip()
+            return "0"
+
+        # 9 列旧格式：…, 至今涨幅, 卖出份额, 满7日剩余 → 在卖出前插入买入份额
+        if len(out) == 9:
+            out = out[:7] + [_buy_from_credited(out)] + out[7:]
+            return out
+        # 8 列旧格式：…, 至今涨幅, 卖出份额 → 插入买入 + 补满7日
+        if len(out) == 8:
+            out = out[:7] + [_buy_from_credited(out)] + out[7:] + ["-"]
+            return out
+
         while len(out) < expected:
             if len(out) == 6:
                 out.append("-")  # 至今涨幅
             elif len(out) == 7:
+                out.append(_buy_from_credited(out))  # 买入份额
+            elif len(out) == 8:
                 out.append("0")  # 卖出份额
             else:
-                out.append("-")  # 满7日剩余等
+                out.append("-")  # 满7日剩余
         return out
 
     def _extract_visible_rows_data(self):
@@ -775,35 +1017,17 @@ class TradeSheet(tk.Frame):
         else:
             self._full_rows_data = visible
 
-    def _split_visible_and_hidden(self, rows_data):
-        """Return (visible, hidden). Hide rows older than HISTORY_MONTHS;
-        if none remain, keep the FALLBACK_VISIBLE_ROWS most recent by date.
-        """
+    def _split_visible_and_hidden(self, rows_data, max_visible=None):
+        """按界面容量切分：表序靠前的留下，放不下的收入「更多交易」。"""
         if not rows_data:
             return [], []
-
-        cutoff = self._months_ago(datetime.now().date(), HISTORY_MONTHS)
-        recent = []
-        older = []
-        for row in rows_data:
-            d = self._parse_row_date(row)
-            if d is None or d >= cutoff:
-                recent.append(row)
-            else:
-                older.append(row)
-
-        if recent:
-            return recent, older
-
-        # All older than cutoff: keep the N most recent by date (file order among them)
-        indexed = list(enumerate(rows_data))
-        indexed.sort(
-            key=lambda item: self._parse_row_date(item[1]) or datetime.min.date(),
-            reverse=True,
-        )
-        keep_indices = {idx for idx, _ in indexed[:FALLBACK_VISIBLE_ROWS]}
-        visible = [row for i, row in enumerate(rows_data) if i in keep_indices]
-        hidden = [row for i, row in enumerate(rows_data) if i not in keep_indices]
+        if max_visible is None:
+            max_visible = self._max_visible_rows()
+        max_visible = max(1, int(max_visible))
+        if len(rows_data) <= max_visible:
+            return [list(r) for r in rows_data], []
+        visible = [list(r) for r in rows_data[:max_visible]]
+        hidden = [list(r) for r in rows_data[max_visible:]]
         return visible, hidden
 
     def _clear_data_rows(self):
@@ -884,9 +1108,12 @@ class TradeSheet(tk.Frame):
 
                 self.is_qdii_var.set(bool(top_info.get("is_qdii", False)))
 
-                visible, hidden = self._split_visible_and_hidden(self._full_rows_data)
+                # 先用回退容量切分；布局完成后 _refit_history_to_viewport 再按真实高度调整
+                visible, hidden = self._split_visible_and_hidden(
+                    self._full_rows_data, max_visible=FALLBACK_VISIBLE_ROWS
+                )
                 self._hidden_rows_data = hidden
-                self._history_collapsed = bool(hidden)
+                self._history_collapsed = True
                 # Keep a stable save order while collapsed: visible then hidden
                 self._full_rows_data = [list(r) for r in visible] + [list(r) for r in hidden]
 
@@ -913,6 +1140,7 @@ class TradeSheet(tk.Frame):
             self.render_action_buttons()
             self._recompute_lot_state()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            self.after(80, self._refit_history_to_viewport)
 
     def _fetch_fund_name_async(self):
         try:

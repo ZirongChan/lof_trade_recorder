@@ -15,8 +15,8 @@ class TableManager(tk.Tk):
         
         # App title
         self.title("LOF套利记账本")
-        self.geometry("1300x600")
-        self.minsize(1200, 500)
+        self.geometry("1400x600")
+        self.minsize(1300, 500)
         
         # create headers
         self.headers = [
@@ -27,6 +27,7 @@ class TableManager(tk.Tk):
             "申购成本/份",
             "预估利润",
             "至今涨幅",
+            "买入份额",
             "卖出份额",
             "满7日剩余",
         ]
@@ -184,11 +185,11 @@ class TableManager(tk.Tk):
        
     def on_tab_change(self, event):
         # 固定最小窗口；表格在 sheet 内滚动，不再随行数无限拉高
-        self.minsize(1200, 500)
+        self.minsize(1300, 500)
         self.update_idletasks()
-        width = max(self.winfo_width(), 1200)
+        width = max(self.winfo_width(), 1300)
         height = max(self.winfo_height(), 500)
-        if self.winfo_width() < 1200 or self.winfo_height() < 500:
+        if self.winfo_width() < 1300 or self.winfo_height() < 500:
             self.geometry(f"{width}x{height}")
 
     def delete_current_sheet(self):

@@ -136,44 +136,37 @@ def subscribe(code, money_amount, date):
             declared_rate = actual_rate
             actual_rate = declared_rate * 0.1
 
-        # 申购当天的净值
-        offset = 1
-        while 1:
+        # 申购当天的净值（与 fetch_otc_fund_net_value 一致，限制回溯天数）
+        net_val_to_buy = None
+        for offset in range(1, 101):
             price_info = fund.price.iloc[-offset]
-            
-            val_date = price_info['date'].strftime('%Y-%m-%d')
-
+            val_date = price_info["date"].strftime("%Y-%m-%d")
             if val_date == date:
-                net_val_to_buy = price_info['netvalue']
-                # print("net_val: ", net_val_to_buy)
+                net_val_to_buy = price_info["netvalue"]
                 break
-            else:
-                offset += 1
+        if net_val_to_buy is None:
+            return None
 
         # 预先扣除掉手续费
         money_to_buy = money_amount * (1 - declared_rate * 0.01)
-        # print("money_to_buy: ", money_to_buy)
 
         share_amount_bought = floor(money_to_buy / net_val_to_buy)
-        # print("share_amount_bought: ", share_amount_bought)
+        if share_amount_bought <= 0:
+            return None
 
         money_for_shares = share_amount_bought * net_val_to_buy
         fee = money_for_shares * actual_rate * 0.01
 
         total_money_spent = round(money_for_shares + fee + 0.005, 2)
-        # print("total_money_spent: ", total_money_spent)
-
-        # trick for half_up_round
         fee = round(fee + 0.005, 2)
-        # print("fee: ", fee)
-
         cost_per_share = round(total_money_spent / share_amount_bought + 0.0005, 3)
 
         return {
-            "share_amount_bought": share_amount_bought,
-            "fee": fee,
-            "total_money": total_money_spent,
-            "cost_per_share": cost_per_share
+            "share_amount_bought": int(share_amount_bought),
+            "fee": float(fee),
+            "total_money": float(total_money_spent),
+            "cost_per_share": float(cost_per_share),
+            "net_value": float(net_val_to_buy),
         }
 
     except Exception as e:
