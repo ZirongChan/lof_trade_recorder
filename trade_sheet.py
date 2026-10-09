@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 
 import tkinter as tk
 from tkinter import ttk
@@ -44,6 +45,8 @@ class TradeSheet(tk.Frame):
         self._history_collapsed = True
         self._refitting = False
         self._fit_after_id = None
+        self._refresh_busy = False
+        self._refresh_gen = 0
         self.is_qdii_var = tk.BooleanVar(value=False)
 
         self._configure_style()
@@ -237,6 +240,10 @@ class TradeSheet(tk.Frame):
                     cell.insert(0, prefill[header])
                 else:
                     cell.insert(0, "0")
+            elif header == "申购成本/份":
+                cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
+                raw = (prefill or {}).get(header, "-")
+                cell.insert(0, self._format_cost_per_share(raw if raw not in (None, "") else "-"))
             elif header == "满7日剩余":
                 cell = tk.Entry(
                     self.table_frame,
@@ -302,14 +309,27 @@ class TradeSheet(tk.Frame):
             self.canvas.yview_moveto(0.0)
 
     def handle_entry_return(self, event):
+        if self._batch_loading or self._refitting:
+            return
         widget = event.widget
         try:
+            if not widget.winfo_exists():
+                return
             grid_row = int(widget.grid_info()["row"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, tk.TclError):
             return
         self.update_result(grid_row)
 
     def handle_sell_return(self, event):
+        if self._batch_loading or self._refitting:
+            return
+        widget = getattr(event, "widget", None)
+        if widget is not None:
+            try:
+                if not widget.winfo_exists():
+                    return
+            except tk.TclError:
+                return
         self._recompute_lot_state()
         if not self._batch_loading:
             self.save_data()
@@ -467,69 +487,110 @@ class TradeSheet(tk.Frame):
             cell.configure(state="readonly")
 
     def _calc_subscription_fields(self, fund_code, date_str, buy_money_amount):
-        """按申购金额计算净值/到账/成本/买入份额。金额≤0 时清空申购字段，仍尽量取净值。"""
-        result = {
-            "nav": None,
-            "shares": None,
-            "cost": None,
-            "buy_shares": "0",
-            "error": None,
-        }
-        if not date_str:
-            result["error"] = "empty date"
-            return result
-
-        if buy_money_amount <= 0:
-            # 无申购：清空到账/成本/买入；净值仍拉取供「至今涨幅」
-            nav = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
-            result["nav"] = nav
-            result["shares"] = "-"
-            result["cost"] = "-"
-            result["buy_shares"] = "0"
-            return result
-
-        buy_res = xalpha_tool.subscribe(fund_code, buy_money_amount, date_str)
-        if buy_res is None:
-            # 回退只查净值，便于区分「无净值」与「申购计算失败」
-            nav = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
-            result["nav"] = nav
-            if nav is None:
-                result["error"] = f"{date_str} 无净值数据 for {fund_code}"
-            else:
-                result["error"] = f"subscribe failed for {fund_code} @ {date_str}"
-            return result
-
-        result["nav"] = buy_res.get("net_value")
-        if result["nav"] is None:
-            result["nav"] = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
-        shares = buy_res["share_amount_bought"]
-        result["shares"] = shares
-        result["cost"] = buy_res["cost_per_share"]
-        result["buy_shares"] = shares
+        """按申购金额计算净值/到账/成本/买入份额（走 xalpha 缓存，同代码只拉一次）。"""
+        result = xalpha_tool.calc_subscription_fields(
+            fund_code, date_str, buy_money_amount
+        )
+        if result.get("cost") is not None:
+            result["cost"] = self._format_cost_per_share(result["cost"])
         return result
 
+    def _calc_subscription_fields_local_clear(self, buy_money_amount):
+        """金额≤0：只清空申购派生列（到账/成本），不动买入/卖出。"""
+        if buy_money_amount > 0:
+            return None
+        return {
+            "nav": None,
+            "shares": "-",
+            "cost": "-",
+            "buy_shares": None,
+            "error": None,
+        }
+
+    @staticmethod
+    def _is_blank_share(value):
+        text = str(value).strip() if value is not None else ""
+        return text in ("", "-", "0")
+
+    def _maybe_fill_buy_shares(self, current_buy, suggested):
+        """申购成功后：仅当买入份额为空/0 时用到账份额预填，不覆盖已有买入。"""
+        if suggested is None:
+            return None
+        if self._is_blank_share(current_buy):
+            return suggested
+        return None
+
+    @staticmethod
+    def _format_3dp(value):
+        """金额类字段固定 3 位小数；'-' / 空保持为 '-'。"""
+        if value is None:
+            return "-"
+        text = str(value).strip()
+        if text in ("", "-"):
+            return "-"
+        try:
+            return f"{float(text):.3f}"
+        except (TypeError, ValueError):
+            return text
+
+    @classmethod
+    def _format_cost_per_share(cls, value):
+        """申购成本/份固定显示为 3 位小数。"""
+        return cls._format_3dp(value)
+
+    def _set_market_price_display(self, value):
+        """顶部场内价格：强制 3 位小数。"""
+        text = self._format_3dp(value)
+        self.top_slot4.delete(0, tk.END)
+        if text != "-":
+            self.top_slot4.insert(0, text)
+            try:
+                self.rt_price = float(text)
+            except (TypeError, ValueError):
+                pass
+        else:
+            self.top_slot4.insert(0, "-")
+
+    def _reformat_all_cost_displays(self):
+        """把界面与隐藏行里已有成本统一成 3 位小数（不依赖联网重算）。"""
+        cost_i = 4
+        for row in self.rows:
+            if cost_i >= len(row):
+                continue
+            formatted = self._format_cost_per_share(row[cost_i].get())
+            if formatted != row[cost_i].get():
+                self._write_cell(row[cost_i], formatted)
+        for row in self._hidden_rows_data:
+            if len(row) > cost_i:
+                row[cost_i] = self._format_cost_per_share(row[cost_i])
+
     def _apply_calc_to_row_widgets(self, row, calc):
-        if calc["nav"] is not None:
+        if calc.get("nav") is not None:
             self._write_cell(row[1], calc["nav"])
-        if calc["shares"] is not None:
+        if calc.get("shares") is not None:
             self._write_cell(row[3], calc["shares"])
-        if calc["cost"] is not None:
-            self._write_cell(row[4], calc["cost"])
-        if calc["buy_shares"] is not None:
-            self._write_cell(row[self.buy_col_index], calc["buy_shares"])
+        if calc.get("cost") is not None:
+            self._write_cell(row[4], self._format_cost_per_share(calc["cost"]))
+        fill_buy = self._maybe_fill_buy_shares(
+            row[self.buy_col_index].get(), calc.get("buy_shares")
+        )
+        if fill_buy is not None:
+            self._write_cell(row[self.buy_col_index], fill_buy)
 
     def _apply_calc_to_row_data(self, row_data, calc):
         expected = len(self.headers)
         while len(row_data) < expected:
             row_data.append("-")
-        if calc["nav"] is not None:
+        if calc.get("nav") is not None:
             row_data[1] = str(calc["nav"])
-        if calc["shares"] is not None:
+        if calc.get("shares") is not None:
             row_data[3] = str(calc["shares"])
-        if calc["cost"] is not None:
-            row_data[4] = str(calc["cost"])
-        if calc["buy_shares"] is not None:
-            row_data[self.buy_col_index] = str(calc["buy_shares"])
+        if calc.get("cost") is not None:
+            row_data[4] = self._format_cost_per_share(calc["cost"])
+        current_buy = row_data[self.buy_col_index] if len(row_data) > self.buy_col_index else "0"
+        fill_buy = self._maybe_fill_buy_shares(current_buy, calc.get("buy_shares"))
+        if fill_buy is not None:
+            row_data[self.buy_col_index] = str(fill_buy)
 
     def update_result(self, row_index, save=True):
         row_index_in_list = row_index - DATA_GRID_OFFSET
@@ -550,6 +611,19 @@ class TradeSheet(tk.Frame):
                 buy_money_amount = self._parse_buy_money(row[2].get())
             except ValueError:
                 print("money amount for buying is not right, plz check and re-try.\n")
+                return
+
+            if buy_money_amount <= 0:
+                calc = self._calc_subscription_fields_local_clear(buy_money_amount)
+                self._apply_calc_to_row_widgets(row, calc)
+                # 无申购仍尽量补净值，供至今涨幅（有缓存时几乎不耗时）
+                nav = xalpha_tool.fetch_otc_fund_net_value(fund_code, date_str)
+                if nav is not None:
+                    self._write_cell(row[1], nav)
+                self.update_profit_cell(row)
+                self._recompute_lot_state()
+                if save and not self._batch_loading:
+                    self.save_data()
                 return
 
             calc = self._calc_subscription_fields(fund_code, date_str, buy_money_amount)
@@ -576,38 +650,141 @@ class TradeSheet(tk.Frame):
         if save and not self._batch_loading:
             self.save_data()
 
-    def _refresh_hidden_subscription_rows(self):
-        """折叠中的行也按申购金额重算，避免展开后仍是旧的「-」。"""
-        if not self._hidden_rows_data:
+    def _set_refresh_button_busy(self, busy):
+        btn = getattr(self, "update_profits_btn", None)
+        if btn is None:
             return
+        try:
+            btn.configure(state=("disabled" if busy else "normal"))
+            btn.configure(text=("刷新中…" if busy else "刷新利润/涨幅"))
+        except Exception:
+            pass
+
+    def _collect_subscribe_jobs(self):
+        """收集需要联网重算的行（申购金额>0）。金额≤0 只做本地清空。"""
+        jobs = []
         fund_code = self.sheet_name
         if len(fund_code) != 6 or not fund_code.isdigit():
-            return
-        for row in self._hidden_rows_data:
+            return jobs
+
+        for i, row in enumerate(self.rows):
+            date_str = self._date_str_from_cell(row[0])
+            try:
+                buy_money = self._parse_buy_money(row[2].get())
+            except ValueError:
+                continue
+            if buy_money <= 0:
+                calc = self._calc_subscription_fields_local_clear(buy_money)
+                self._apply_calc_to_row_widgets(row, calc)
+                continue
+            jobs.append(
+                {
+                    "kind": "visible",
+                    "index": i,
+                    "date": date_str,
+                    "money": buy_money,
+                }
+            )
+
+        for i, row in enumerate(self._hidden_rows_data):
             normalized = self._normalize_row(row)
             if normalized is None:
                 continue
             row[:] = normalized
             date_str = str(row[0])[:10]
             try:
-                buy_money_amount = self._parse_buy_money(str(row[2]))
+                buy_money = self._parse_buy_money(str(row[2]))
             except ValueError:
                 continue
-            calc = self._calc_subscription_fields(fund_code, date_str, buy_money_amount)
-            if calc["error"] and buy_money_amount > 0:
-                if calc["nav"] is not None:
-                    row[1] = str(calc["nav"])
+            if buy_money <= 0:
+                self._apply_calc_to_row_data(
+                    row, self._calc_subscription_fields_local_clear(buy_money)
+                )
                 continue
-            self._apply_calc_to_row_data(row, calc)
+            jobs.append(
+                {
+                    "kind": "hidden",
+                    "index": i,
+                    "date": date_str,
+                    "money": buy_money,
+                }
+            )
+        return jobs
+
+    def _apply_subscribe_job_results(self, results):
+        for job, calc in results:
+            if calc is None:
+                continue
+            if calc.get("error") and job["money"] > 0:
+                print(f"错误: {calc['error']}！\n")
+                if calc.get("nav") is not None:
+                    if job["kind"] == "visible" and 0 <= job["index"] < len(self.rows):
+                        self._write_cell(self.rows[job["index"]][1], calc["nav"])
+                    elif job["kind"] == "hidden" and 0 <= job["index"] < len(
+                        self._hidden_rows_data
+                    ):
+                        self._hidden_rows_data[job["index"]][1] = str(calc["nav"])
+                continue
+            if job["kind"] == "visible" and 0 <= job["index"] < len(self.rows):
+                self._apply_calc_to_row_widgets(self.rows[job["index"]], calc)
+            elif job["kind"] == "hidden" and 0 <= job["index"] < len(
+                self._hidden_rows_data
+            ):
+                self._apply_calc_to_row_data(self._hidden_rows_data[job["index"]], calc)
 
     def refresh_derived_metrics(self):
-        # 重新拉净值并重算申购（含金额=0 时清空到账份额），再刷利润/涨幅/满7日
-        self.update_all_results(save=False)
-        self._refresh_hidden_subscription_rows()
+        """利润/涨幅本地即刷；缺净值的申购重算后台一次拉齐（同基金只请求一次）。"""
+        if self._refresh_busy:
+            return
+
+        # 成本 3 位小数：本地立刻改显示，不依赖后台重算
+        self._reformat_all_cost_displays()
+
+        jobs = self._collect_subscribe_jobs()
+        # 先本地刷一遍（含金额=0 清空后的利润/满7日）
         self.update_profits()
         self._recompute_lot_state()
-        if not self._batch_loading:
-            self.save_data()
+        if not jobs:
+            if not self._batch_loading:
+                self.save_data()
+            return
+
+        self._refresh_busy = True
+        self._refresh_gen += 1
+        gen = self._refresh_gen
+        self._set_refresh_button_busy(True)
+        fund_code = self.sheet_name
+
+        def worker():
+            results = []
+            try:
+                # 预热一次 fundinfo；后续 subscribe/净值全走缓存
+                xalpha_tool.get_fund(fund_code)
+                for job in jobs:
+                    calc = self._calc_subscription_fields(
+                        fund_code, job["date"], job["money"]
+                    )
+                    results.append((job, calc))
+            except Exception as e:
+                print(f"刷新申购数据失败: {e}")
+                results = []
+
+            def finish():
+                if gen != self._refresh_gen:
+                    return
+                try:
+                    self._apply_subscribe_job_results(results)
+                    self.update_profits()
+                    self._recompute_lot_state()
+                    if not self._batch_loading:
+                        self.save_data()
+                finally:
+                    self._refresh_busy = False
+                    self._set_refresh_button_busy(False)
+
+            self.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _set_readonly_entry(self, entry, value):
         entry.configure(state="normal")
@@ -629,8 +806,7 @@ class TradeSheet(tk.Frame):
 
     def update_price(self):
         try:
-            self.top_slot4.delete(0, tk.END)
-            self.top_slot4.insert(0, "-")
+            self._set_market_price_display("-")
 
             if self.sheet_name.startswith("50"):
                 fund_code = "SH" + self.sheet_name
@@ -644,10 +820,7 @@ class TradeSheet(tk.Frame):
             if latest_info is not None:
                 percentage = latest_info["percent"]
                 latest_price = latest_info["current"]
-                self.rt_price = latest_price
-
-                self.top_slot4.delete(0, tk.END)
-                self.top_slot4.insert(0, str(latest_price))
+                self._set_market_price_display(latest_price)
 
                 self.top_slot5.delete(0, tk.END)
                 self.top_slot5.insert(0, f"{percentage}%")
@@ -749,7 +922,6 @@ class TradeSheet(tk.Frame):
         buy_i = self.buy_col_index
         sell_i = self.sell_col_index
         mature_i = self.mature_col_index
-        credited_i = 3  # 到账份额（兼容旧数据回退）
 
         indexed = list(enumerate(self._full_rows_data))
         indexed.sort(
@@ -787,8 +959,6 @@ class TradeSheet(tk.Frame):
                         remaining_sell -= take
 
             bought = self.safe_float(row[buy_i])
-            if bought <= 0:
-                bought = self.safe_float(row[credited_i])
             if bought > 0:
                 confirm = self.add_trading_days(as_of, confirm_n)
                 lots.append({"confirm": confirm, "remain": bought})
@@ -823,7 +993,7 @@ class TradeSheet(tk.Frame):
         data = {
             "top_info": {
                 "fund_name": self.top_slot2.get(),
-                "real_time_price": self.top_slot4.get(),
+                "real_time_price": self._format_3dp(self.top_slot4.get()),
                 "is_qdii": bool(self.is_qdii_var.get()),
             },
             "rows": self._full_rows_data,
@@ -883,7 +1053,8 @@ class TradeSheet(tk.Frame):
 
     def _extract_one_row_data(self, row_widgets):
         row_data = []
-        for cell in row_widgets:
+        cost_i = 4
+        for col_i, cell in enumerate(row_widgets):
             if isinstance(cell, DateEntry):
                 val = cell.get_date().strftime("%Y-%m-%d")
             elif isinstance(cell, (tk.Entry, ttk.Combobox)):
@@ -892,6 +1063,8 @@ class TradeSheet(tk.Frame):
                 val = cell["text"]
             else:
                 val = ""
+            if col_i == cost_i:
+                val = self._format_cost_per_share(val)
             row_data.append(val)
         return row_data
 
@@ -976,28 +1149,31 @@ class TradeSheet(tk.Frame):
         # 9 列旧格式：…, 至今涨幅, 卖出份额, 满7日剩余 → 在卖出前插入买入份额
         if len(out) == 9:
             out = out[:7] + [_buy_from_credited(out)] + out[7:]
-            return out
         # 8 列旧格式：…, 至今涨幅, 卖出份额 → 插入买入 + 补满7日
-        if len(out) == 8:
+        elif len(out) == 8:
             out = out[:7] + [_buy_from_credited(out)] + out[7:] + ["-"]
-            return out
+        else:
+            while len(out) < expected:
+                if len(out) == 6:
+                    out.append("-")  # 至今涨幅
+                elif len(out) == 7:
+                    out.append(_buy_from_credited(out))  # 买入份额
+                elif len(out) == 8:
+                    out.append("0")  # 卖出份额
+                else:
+                    out.append("-")  # 满7日剩余
 
-        while len(out) < expected:
-            if len(out) == 6:
-                out.append("-")  # 至今涨幅
-            elif len(out) == 7:
-                out.append(_buy_from_credited(out))  # 买入份额
-            elif len(out) == 8:
-                out.append("0")  # 卖出份额
-            else:
-                out.append("-")  # 满7日剩余
+        # 申购成本/份统一 3 位小数
+        if len(out) > 4:
+            out[4] = self._format_cost_per_share(out[4])
         return out
 
     def _extract_visible_rows_data(self):
         rows_data = []
+        cost_i = 4
         for row in self.rows:
             row_data = []
-            for cell in row:
+            for col_i, cell in enumerate(row):
                 if isinstance(cell, DateEntry):
                     val = cell.get_date().strftime("%Y-%m-%d")
                 elif isinstance(cell, (tk.Entry, ttk.Combobox)):
@@ -1006,6 +1182,8 @@ class TradeSheet(tk.Frame):
                     val = cell["text"]
                 else:
                     val = ""
+                if col_i == cost_i:
+                    val = self._format_cost_per_share(val)
                 row_data.append(val)
             rows_data.append(row_data)
         return rows_data
@@ -1101,8 +1279,7 @@ class TradeSheet(tk.Frame):
                 self.top_slot2.delete(0, tk.END)
                 self.top_slot2.insert(0, fund_name)
 
-                self.top_slot4.delete(0, tk.END)
-                self.top_slot4.insert(0, top_info.get("real_time_price", ""))
+                self._set_market_price_display(top_info.get("real_time_price", "") or "-")
 
                 self.top_slot5.delete(0, tk.END)
 
@@ -1137,6 +1314,7 @@ class TradeSheet(tk.Frame):
                 self._history_collapsed = False
         finally:
             self._batch_loading = False
+            self._reformat_all_cost_displays()
             self.render_action_buttons()
             self._recompute_lot_state()
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
