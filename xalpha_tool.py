@@ -5,16 +5,29 @@ import xalpha as xa
 # fundinfo 含全历史净值，重复拉取很慢；按代码缓存
 _fund_cache = {}
 _nav_map_cache = {}
+_redeem_tiers_cache = {}
+
+# 无费率数据时的回退：仅「满7日剩余」一档（与旧列语义一致）
+DEFAULT_REDEEM_TIERS = (
+    {
+        "label": "满7日剩余",
+        "rate_pct": None,
+        "day_lo": 7,
+        "day_hi": None,
+    },
+)
 
 
 def clear_fund_cache(code=None):
     if code is None:
         _fund_cache.clear()
         _nav_map_cache.clear()
+        _redeem_tiers_cache.clear()
         return
     code = str(code)
     _fund_cache.pop(code, None)
     _nav_map_cache.pop(code, None)
+    _redeem_tiers_cache.pop(code, None)
 
 
 def get_fund(code, force_refresh=False):
@@ -22,6 +35,7 @@ def get_fund(code, force_refresh=False):
     if force_refresh or code not in _fund_cache:
         _fund_cache[code] = xa.fundinfo(code)
         _nav_map_cache.pop(code, None)
+        _redeem_tiers_cache.pop(code, None)
     return _fund_cache[code]
 
 
@@ -113,6 +127,17 @@ def _fee_rates(fund):
     return declared_rate, actual_rate
 
 
+def get_subscribe_actual_rate(code):
+    """记账本申购采用的实际费率（%），如 0.12；失败返回 None。"""
+    try:
+        if not code or not str(code).isdigit() or len(str(code)) != 6:
+            return None
+        _declared, actual = _fee_rates(get_fund(str(code)))
+        return float(actual)
+    except Exception:
+        return None
+
+
 def subscribe_xalpha(code, money_amount, date):
     try:
         fund = get_fund(code)
@@ -157,10 +182,88 @@ def subscribe(code, money_amount, date):
         return None
 
 
+def _parse_rate_pct(text):
+    try:
+        return float(str(text).strip().replace("%", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tier_short_label(day_lo, day_hi, rate_pct):
+    """由持有天下界生成短标题，并附费率。"""
+    day_lo = int(day_lo or 0)
+    if day_lo <= 0:
+        if day_hi is not None:
+            base = f"未满{int(day_hi)}日"
+        else:
+            base = "持有中"
+    elif day_lo % 365 == 0 and day_lo >= 365:
+        base = f"满{day_lo // 365}年"
+    elif day_lo == 7:
+        base = "满7日"
+    else:
+        base = f"满{day_lo}日"
+
+    if rate_pct is None:
+        return base if base != "满7日" else "满7日剩余"
+    return f"{base}（{float(rate_pct):.2f}%）"
+
+
+def _tiers_from_feeinfo(feeinfo, segment):
+    """feeinfo 为 [描述, 费率%, ...]；segment 如 [[0,7],[7,365],[365,730],[730]]。"""
+    if not feeinfo or len(feeinfo) < 2 or len(feeinfo) % 2 != 0:
+        return None
+    n = len(feeinfo) // 2
+    tiers = []
+    for i in range(n):
+        rate_pct = _parse_rate_pct(feeinfo[2 * i + 1])
+        day_lo, day_hi = 0, None
+        if segment and i < len(segment):
+            seg = segment[i]
+            if isinstance(seg, (list, tuple)) and len(seg) >= 1:
+                day_lo = int(seg[0])
+                day_hi = int(seg[1]) if len(seg) >= 2 else None
+        label = _tier_short_label(day_lo, day_hi, rate_pct)
+        tiers.append(
+            {
+                "label": label,
+                "rate_pct": rate_pct,
+                "day_lo": day_lo,
+                "day_hi": day_hi,
+            }
+        )
+    return tiers or None
+
+
+def get_redeem_tiers(code=None):
+    """
+    赎回费率持有期限分段。
+    返回 [{label, rate_pct, day_lo, day_hi}, ...]；day_hi 为 None 表示无上界。
+    """
+    if not code or not str(code).isdigit() or len(str(code)) != 6:
+        return [dict(t) for t in DEFAULT_REDEEM_TIERS]
+
+    code = str(code)
+    if code in _redeem_tiers_cache:
+        return [dict(t) for t in _redeem_tiers_cache[code]]
+
+    try:
+        fund = get_fund(code)
+        feeinfo = getattr(fund, "feeinfo", None) or []
+        segment = getattr(fund, "segment", None)
+        tiers = _tiers_from_feeinfo(feeinfo, segment)
+        if not tiers:
+            tiers = [dict(t) for t in DEFAULT_REDEEM_TIERS]
+        _redeem_tiers_cache[code] = [dict(t) for t in tiers]
+        return [dict(t) for t in tiers]
+    except Exception:
+        return [dict(t) for t in DEFAULT_REDEEM_TIERS]
+
+
 def calc_subscription_fields(code, date_str, buy_money_amount):
     """
     按申购金额计算净值/到账/成本。
-    金额≤0：清空申购字段，仍尽量取净值；不改买入/卖出。
+    金额≤0：清空申购字段，仍尽量取净值；不改买入/卖出/赎回。
     buy_shares 仅在申购成功时给出建议值（到账份额），由 UI 决定是否写入。
     """
     result = {

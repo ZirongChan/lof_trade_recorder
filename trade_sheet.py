@@ -4,6 +4,7 @@ import time
 import threading
 
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
 from tkcalendar import DateEntry
 
@@ -18,6 +19,25 @@ DATA_GRID_OFFSET = 1
 # Canvas 尚未布局完成时的可见行数回退值
 FALLBACK_VISIBLE_ROWS = 8
 
+# 固定列（到赎回份额）；其后为动态赎回分段列
+BASE_HEADERS = [
+    "日期",
+    "净值",
+    "申购金额",
+    "到账份额",
+    "申购成本/份",
+    "预估利润",
+    "至今涨幅",
+    "买入份额",
+    "卖出份额",
+    "赎回份额",
+]
+BASE_COL_COUNT = len(BASE_HEADERS)
+# 引入「赎回份额」之前的基础列数（到卖出份额为止）
+PRE_REDEEM_COL_BASE = 9
+_PHASE_OUT = 0
+_PHASE_IN = 1
+
 
 class TradeSheet(tk.Frame):
     def __init__(self, parent, headers, sheet_name):
@@ -26,16 +46,17 @@ class TradeSheet(tk.Frame):
 
         super().__init__(parent)
 
-        self.headers = headers
+        # headers 参数兼容旧调用；实际以 BASE + 赎回档为准
+        self.redeem_tiers = [dict(t) for t in xalpha_tool.DEFAULT_REDEEM_TIERS]
+        self._all_redeem_tiers = [dict(t) for t in self.redeem_tiers]
+        self._subscribe_actual_rate = None
+        self._filter_lock = False
         self.sheet_name = sheet_name
         self.rows = []
-        self.cell_width = 14
         self.rt_price = 0
-        self.profit_col_index = self.headers.index("预估利润")
-        self.gain_col_index = self.headers.index("至今涨幅")
-        self.buy_col_index = self.headers.index("买入份额")
-        self.sell_col_index = self.headers.index("卖出份额")
-        self.mature_col_index = self.headers.index("满7日剩余")
+        self._header_labels = []
+        self.headers = self._compose_headers(self.redeem_tiers)
+        self._refresh_col_indices()
         self.selected_row_indices = set()
         self._anchor_row_index = None
         self._selection_from_click = False
@@ -47,6 +68,8 @@ class TradeSheet(tk.Frame):
         self._fit_after_id = None
         self._refresh_busy = False
         self._refresh_gen = 0
+        self._tiers_loading = False
+        self._legacy_without_redeem_col = False
         self.is_qdii_var = tk.BooleanVar(value=False)
 
         self._configure_style()
@@ -94,6 +117,87 @@ class TradeSheet(tk.Frame):
         # Stagger price refresh across tabs to avoid a startup request stampede
         price_delay = 80 + (sum(ord(c) for c in sheet_name) % 17) * 120
         self.after(price_delay, self.update_price)
+        # 有 6 位代码时后台拉赎回分段并换列
+        if str(sheet_name).isdigit() and len(str(sheet_name)) == 6:
+            self.after(price_delay + 40, self.reload_redeem_tiers_async)
+
+    def _compose_headers(self, redeem_tiers):
+        """基础列 + 赎回档；申购金额标题附申购实际费率。"""
+        base = list(BASE_HEADERS)
+        if self._subscribe_actual_rate is not None:
+            base[2] = f"申购金额（{float(self._subscribe_actual_rate):.2f}%）"
+        else:
+            base[2] = "申购金额"
+        return base + [t["label"] for t in redeem_tiers]
+
+    def preferred_window_width(self):
+        """按表格实际需求宽度估算窗口（隐藏零份额赎回列后应收窄）。"""
+        self.update_idletasks()
+        table_w = int(self.table_frame.winfo_reqwidth() or 0)
+        top_w = int(self.top_info_bar.winfo_reqwidth() or 0)
+        # 以表格为主；顶栏不应单独把窗口撑得更宽
+        content_w = max(table_w, min(top_w, table_w + 40) if table_w else top_w)
+        # 滚动条 + 边距
+        return max(980, content_w + 48)
+
+    def _notify_window_fit(self):
+        root = self.winfo_toplevel()
+        fit = getattr(root, "fit_window_to_active_sheet", None)
+        if callable(fit):
+            try:
+                root.after_idle(fit)
+            except Exception:
+                pass
+
+    def _refresh_col_indices(self):
+        def _find(prefix, exact=None):
+            for i, h in enumerate(self.headers):
+                if exact is not None and h == exact:
+                    return i
+                if h == prefix or str(h).startswith(prefix):
+                    return i
+            raise ValueError(prefix)
+
+        self.profit_col_index = _find("预估利润")
+        self.gain_col_index = _find("至今涨幅")
+        self.buy_col_index = _find("买入份额")
+        self.sell_col_index = _find("卖出份额")
+        self.redeem_shares_col_index = _find("赎回份额")
+        self.amount_col_index = 2
+        self.credited_col_index = 3
+        self.redeem_col_indices = list(range(BASE_COL_COUNT, len(self.headers)))
+
+    def _is_redeem_col(self, col_index):
+        return col_index >= BASE_COL_COUNT
+
+    def _is_amount_header(self, header):
+        return header == "申购金额" or str(header).startswith("申购金额")
+
+    def _is_credited_header(self, header):
+        return header == "到账份额" or str(header).startswith("到账份额")
+
+    @staticmethod
+    def _format_share_amount(value):
+        try:
+            n = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if abs(n - round(n)) < 1e-9:
+            return str(int(round(n)))
+        return str(round(n, 2))
+
+    def _make_redeem_cell(self, grid_row, col_index, raw="-"):
+        cell = tk.Entry(
+            self.table_frame,
+            width=self._col_char_width(self.headers[col_index] if col_index < len(self.headers) else ""),
+            justify="center",
+            state="readonly",
+            readonlybackground="white",
+        )
+        self._set_entry_value(cell, raw if raw not in (None, "") else "-")
+        self._bind_row_cell(cell, self.headers[col_index] if col_index < len(self.headers) else "")
+        cell.grid(row=grid_row, column=col_index, sticky="nsew")
+        return cell
 
     def _on_frame_configure(self, event):
         # Only update scroll region — do not grow canvas to full table height
@@ -130,67 +234,110 @@ class TradeSheet(tk.Frame):
         self.update_idletasks()
         return self.winfo_reqheight()
 
+    def _text_char_units(self, text):
+        """按默认字体把文字折成 Tk 的字符宽度（以 '0' 为 1），保证能画全。"""
+        sample = "" if text is None else str(text)
+        if not sample:
+            return 4
+        f = tkfont.nametofont("TkDefaultFont")
+        zero = max(f.measure("0"), 1)
+        px = f.measure(sample)
+        return max(4, (px + zero - 1) // zero + 2)
+
+    def _col_char_width(self, header):
+        """列宽以该列表头完整显示为准；日期列同时容下 yyyy-mm-dd。"""
+        width = self._text_char_units(header)
+        if header in ("日期", "Date"):
+            # DateEntry 右侧还有日历按钮，比纯文字更宽
+            width = max(width, self._text_char_units("2026-10-09") + 3)
+        return width
+
+    def _col_min_pixels(self, header):
+        f = tkfont.nametofont("TkDefaultFont")
+        text = "" if header is None else str(header)
+        px = f.measure(text)
+        if header in ("日期", "Date"):
+            px = max(px, f.measure("2026-10-09") + 22)
+        return px + 16
+
     def draw_table(self):
-        for i in range(len(self.headers)):
-            self.table_frame.columnconfigure(i, weight=1, uniform="colgroup")
+        for lbl in self._header_labels:
+            try:
+                lbl.destroy()
+            except Exception:
+                pass
+        self._header_labels = []
+        # 不用 uniform：各列只跟自己的表头走，避免被最长标题撑成等宽
+        for i in range(max(len(self.headers), 16)):
+            minsize = self._col_min_pixels(self.headers[i]) if i < len(self.headers) else 0
+            self.table_frame.columnconfigure(
+                i,
+                weight=0 if i >= len(self.headers) else 1,
+                uniform="",
+                minsize=minsize,
+            )
         for i, header in enumerate(self.headers):
             lbl = tk.Label(
                 self.table_frame,
                 text=header,
                 borderwidth=1,
                 relief="solid",
-                width=self.cell_width,
+                width=self._col_char_width(header),
                 anchor="center",
             )
             lbl.grid(row=0, column=i, sticky="nsew")
+            self._header_labels.append(lbl)
 
     def draw_top_info_row(self):
-        # 基金名称 | 名称 | 当前时间 | 当前场内价格 | 价格 | 涨跌幅 | QDII
+        # 基金名称 | 名称 | 当前时间 | 场内价格 | 价格 | 涨跌幅 | QDII
+        # 不设 uniform，避免顶栏 7 格被最宽控件等宽撑开、拖大整窗
         for c in range(7):
-            self.top_info_bar.columnconfigure(c, weight=1, uniform="topinfo")
+            self.top_info_bar.columnconfigure(c, weight=0)
+        self.top_info_bar.columnconfigure(1, weight=1)  # 基金名可伸展
 
         self.top_slot1 = tk.Label(
-            self.top_info_bar, text="基金名称", width=self.cell_width, anchor="center"
+            self.top_info_bar, text="基金名称", width=7, anchor="center"
         )
-        self.top_slot1.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        self.top_slot1.grid(row=0, column=0, sticky="nsw", padx=(0, 2))
 
+        # 基金名：略窄，其余顶栏控件略宽
         self.top_slot2 = tk.Entry(
-            self.top_info_bar, width=self.cell_width * 2, justify="center", fg="blue"
+            self.top_info_bar, width=14, justify="center", fg="blue"
         )
         self.top_slot2.grid(row=0, column=1, sticky="nsew", padx=2)
 
         self.top_time_slot = tk.Entry(
             self.top_info_bar,
-            width=self.cell_width + 4,
+            width=16,
             justify="center",
             fg="#333333",
             state="readonly",
             readonlybackground=self.top_info_bar.cget("bg"),
         )
-        self.top_time_slot.grid(row=0, column=2, sticky="nsew", padx=2)
+        self.top_time_slot.grid(row=0, column=2, sticky="nsw", padx=2)
 
         self.top_slot3 = tk.Label(
-            self.top_info_bar, text="当前场内价格", width=self.cell_width, anchor="center"
+            self.top_info_bar, text="场内价格", width=9, anchor="center"
         )
-        self.top_slot3.grid(row=0, column=3, sticky="nsew", padx=2)
+        self.top_slot3.grid(row=0, column=3, sticky="nsw", padx=2)
 
         self.top_slot4 = tk.Entry(
-            self.top_info_bar, width=self.cell_width, justify="center", fg="blue"
+            self.top_info_bar, width=10, justify="center", fg="blue"
         )
-        self.top_slot4.grid(row=0, column=4, sticky="nsew", padx=2)
+        self.top_slot4.grid(row=0, column=4, sticky="nsw", padx=2)
 
         self.top_slot5 = tk.Entry(
-            self.top_info_bar, width=self.cell_width, justify="center"
+            self.top_info_bar, width=9, justify="center"
         )
-        self.top_slot5.grid(row=0, column=5, sticky="nsew", padx=2)
+        self.top_slot5.grid(row=0, column=5, sticky="nsw", padx=2)
 
         self.qdii_check = ttk.Checkbutton(
             self.top_info_bar,
-            text="QDII（T+2确认）",
+            text="QDII（T+2）",
             variable=self.is_qdii_var,
             command=self._on_qdii_toggle,
         )
-        self.qdii_check.grid(row=0, column=6, sticky="nsew", padx=(2, 0))
+        self.qdii_check.grid(row=0, column=6, sticky="nsw", padx=(2, 0))
 
     def _on_qdii_toggle(self):
         self._recompute_lot_state()
@@ -198,12 +345,19 @@ class TradeSheet(tk.Frame):
             self.save_data()
 
     def _is_input_header(self, header):
-        return header in ("Date", "日期", "Sub. in Currency", "申购金额", "买入份额", "卖出份额")
+        return header in (
+            "Date",
+            "日期",
+            "Sub. in Currency",
+            "买入份额",
+            "卖出份额",
+            "赎回份额",
+        ) or self._is_amount_header(header)
 
     def _bind_row_cell(self, cell, header):
         cell.bind("<Button-1>", self._on_cell_button1, add="+")
         cell.bind("<FocusIn>", lambda e, w=cell: self.highlight_selected_row(w))
-        if header in ("买入份额", "卖出份额"):
+        if header in ("买入份额", "卖出份额", "赎回份额"):
             cell.bind("<Return>", self.handle_sell_return)
             cell.bind("<FocusOut>", self.handle_sell_return)
         elif self._is_input_header(header):
@@ -213,10 +367,11 @@ class TradeSheet(tk.Frame):
     def _make_row_widgets(self, grid_row, prefill=None):
         row_widgets = []
         for col_index, header in enumerate(self.headers):
+            col_w = self._col_char_width(header)
             if header in ("Date", "日期"):
                 cell = DateEntry(
                     self.table_frame,
-                    width=self.cell_width,
+                    width=col_w,
                     date_pattern="yyyy-mm-dd",
                     justify="center",
                 )
@@ -228,34 +383,42 @@ class TradeSheet(tk.Frame):
                         cell.set_date(default_day)
                 else:
                     cell.set_date(default_day)
-            elif header in ("Sub. in Currency", "申购金额"):
-                cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
-                if prefill and header in prefill:
-                    cell.insert(0, prefill[header])
-                else:
-                    cell.insert(0, "0")
-            elif header in ("买入份额", "卖出份额"):
-                cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
+            elif header in ("Sub. in Currency",) or self._is_amount_header(header):
+                cell = tk.Entry(self.table_frame, width=col_w, justify="center")
+                raw = None
+                if prefill:
+                    if header in prefill:
+                        raw = prefill[header]
+                    else:
+                        raw = prefill.get("申购金额")
+                        if raw is None:
+                            for k, v in prefill.items():
+                                if str(k).startswith("申购金额"):
+                                    raw = v
+                                    break
+                cell.insert(0, "0" if raw in (None, "") else raw)
+            elif header in ("买入份额", "卖出份额", "赎回份额"):
+                cell = tk.Entry(self.table_frame, width=col_w, justify="center")
                 if prefill and header in prefill and str(prefill[header]).strip() not in ("", "-"):
                     cell.insert(0, prefill[header])
                 else:
                     cell.insert(0, "0")
             elif header == "申购成本/份":
-                cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
+                cell = tk.Entry(self.table_frame, width=col_w, justify="center")
                 raw = (prefill or {}).get(header, "-")
                 cell.insert(0, self._format_cost_per_share(raw if raw not in (None, "") else "-"))
-            elif header == "满7日剩余":
+            elif self._is_redeem_col(col_index):
+                raw = (prefill or {}).get(header, "-") if prefill else "-"
                 cell = tk.Entry(
                     self.table_frame,
-                    width=self.cell_width,
+                    width=col_w,
                     justify="center",
                     state="readonly",
                     readonlybackground="white",
                 )
-                raw = (prefill or {}).get(header, "-")
                 self._set_entry_value(cell, raw if raw not in (None, "") else "-")
             else:
-                cell = tk.Entry(self.table_frame, width=self.cell_width, justify="center")
+                cell = tk.Entry(self.table_frame, width=col_w, justify="center")
                 if prefill and header in prefill:
                     cell.insert(0, prefill[header])
                 else:
@@ -496,7 +659,7 @@ class TradeSheet(tk.Frame):
         return result
 
     def _calc_subscription_fields_local_clear(self, buy_money_amount):
-        """金额≤0：只清空申购派生列（到账/成本），不动买入/卖出。"""
+        """金额≤0：只清空申购派生列（到账/成本），不动买入/卖出/赎回。"""
         if buy_money_amount > 0:
             return None
         return {
@@ -911,17 +1074,105 @@ class TradeSheet(tk.Frame):
                 added += 1
         return d
 
+    def _raw_buckets_for_tiers(self, lots, today, tiers):
+        """按相对今天的持有天数，把剩余批次份额分到给定赎回档（原始 float）。"""
+        buckets = [0.0] * len(tiers)
+        for lot in lots:
+            remain = lot.get("remain", 0) or 0
+            if remain <= 0:
+                continue
+            # 申购批次确认日未到之前不计入赎回持有天数
+            days = (today - lot["confirm"]).days
+            if days < 0:
+                continue
+            for ti, tier in enumerate(tiers):
+                lo = int(tier.get("day_lo") or 0)
+                hi = tier.get("day_hi")
+                if days < lo:
+                    continue
+                if hi is not None and days >= int(hi):
+                    continue
+                buckets[ti] += remain
+                break
+        return buckets
+
+    def _bucket_remaining_by_tier(self, lots, today, tiers=None):
+        tiers = tiers if tiers is not None else self.redeem_tiers
+        return [
+            self._format_share_amount(v)
+            for v in self._raw_buckets_for_tiers(lots, today, tiers)
+        ]
+
+    def _filter_nonzero_tiers(self, lots, today):
+        """当前持仓中份额>0 的赎回档；全为 0 则返回空列表（不显示赎回列）。"""
+        all_tiers = self._all_redeem_tiers or self.redeem_tiers
+        if not all_tiers:
+            return []
+        raw = self._raw_buckets_for_tiers(lots, today, all_tiers)
+        return [dict(t) for t, v in zip(all_tiers, raw) if v > 1e-9]
+
+    def _share_flows_for_row(self, row, as_of, confirm_n):
+        """
+        四个动作对持仓的生效日不同：
+        - 到账份额（申购）：T+confirm_n 才增加，持有期从确认日起算
+        - 买入份额：T 日增加；同日已有到账时只计超出部分，避免预填重复
+        - 卖出份额：T 日从已确认批次扣减
+        - 赎回份额：T+confirm_n 才扣减；确认前仍留在分段里
+        返回 (生效日, phase, 份额, 来源)。同一行、同一生效日先流出再流入。
+        """
+        credited = self.safe_float(row[self.credited_col_index]) if len(row) > self.credited_col_index else 0.0
+        bought = self.safe_float(row[self.buy_col_index]) if len(row) > self.buy_col_index else 0.0
+        sold = self.safe_float(row[self.sell_col_index]) if len(row) > self.sell_col_index else 0.0
+        redeemed = (
+            self.safe_float(row[self.redeem_shares_col_index])
+            if len(row) > self.redeem_shares_col_index
+            else 0.0
+        )
+
+        buy_lot = max(0.0, bought - credited) if credited > 0 else bought
+        confirm = self.add_trading_days(as_of, confirm_n)
+        flows = []
+        if sold > 0:
+            flows.append((as_of, _PHASE_OUT, sold, "sell"))
+        if redeemed > 0:
+            flows.append((confirm, _PHASE_OUT, redeemed, "redeem"))
+        if buy_lot > 0:
+            flows.append((as_of, _PHASE_IN, buy_lot, "buy"))
+        if credited > 0:
+            flows.append((confirm, _PHASE_IN, credited, "subscribe"))
+        return flows
+
+    def _lots_from_flows(self, flows, today):
+        """按 (生效日, 行序, 先出后进) 重放；生效日晚于今天的动作先不入账。"""
+        ordered = sorted(flows, key=lambda item: (item[0], item[1], item[2]))
+        lots = []
+        for effective, _seq, phase, shares, source in ordered:
+            if effective > today:
+                continue
+            if phase == _PHASE_IN:
+                lots.append({"confirm": effective, "remain": shares, "source": source})
+                continue
+            left = shares
+            for lot in lots:
+                if left <= 0:
+                    break
+                if lot["confirm"] <= effective and lot["remain"] > 0:
+                    take = min(lot["remain"], left)
+                    lot["remain"] -= take
+                    left -= take
+        return lots
+
     def _recompute_lot_state(self):
-        """FIFO sells by date; 满7日 always measured against today's date."""
+        """FIFO：卖出 T 日扣、赎回 T+x 确认后扣；赎回分段相对今天分档；零份额档不展示。"""
         self._sync_full_from_ui()
         if not self._full_rows_data:
             return
 
         today = datetime.now().date()
         confirm_n = 2 if self.is_qdii_var.get() else 1
-        buy_i = self.buy_col_index
-        sell_i = self.sell_col_index
-        mature_i = self.mature_col_index
+        redeem_cols = list(self.redeem_col_indices)
+        n_redeem = len(redeem_cols)
+        blank = ["-"] * n_redeem
 
         indexed = list(enumerate(self._full_rows_data))
         indexed.sort(
@@ -931,62 +1182,74 @@ class TradeSheet(tk.Frame):
             )
         )
 
-        lots = []
-        results = {}
-
+        parsed = []
         for orig_i, row in indexed:
             normalized = self._normalize_row(row)
             if normalized is None:
-                results[orig_i] = "-"
+                parsed.append({"orig_i": orig_i, "row": row, "as_of": None, "flows": []})
                 continue
             row[:] = normalized
-
             as_of = self._parse_row_date(row)
-            if as_of is None:
-                results[orig_i] = "-"
-                row[mature_i] = "-"
+            flows = self._share_flows_for_row(row, as_of, confirm_n) if as_of else []
+            parsed.append({"orig_i": orig_i, "row": row, "as_of": as_of, "flows": flows})
+
+        tagged = []
+        for seq, item in enumerate(parsed):
+            for effective, phase, shares, source in item["flows"]:
+                tagged.append((effective, seq, phase, shares, source))
+
+        results = {}
+        final_lots = self._lots_from_flows(tagged, today)
+        for seq, item in enumerate(parsed):
+            orig_i = item["orig_i"]
+            row = item["row"]
+            if item["as_of"] is None:
+                results[orig_i] = list(blank)
+                for ci in redeem_cols:
+                    if ci < len(row):
+                        row[ci] = "-"
                 continue
-
-            sell = self.safe_float(row[sell_i])
-            if sell > 0:
-                remaining_sell = sell
-                for lot in lots:
-                    if remaining_sell <= 0:
-                        break
-                    if lot["confirm"] <= as_of and lot["remain"] > 0:
-                        take = min(lot["remain"], remaining_sell)
-                        lot["remain"] -= take
-                        remaining_sell -= take
-
-            bought = self.safe_float(row[buy_i])
-            if bought > 0:
-                confirm = self.add_trading_days(as_of, confirm_n)
-                lots.append({"confirm": confirm, "remain": bought})
-
-            # 满7日：相对「今天」实时判断，不是相对行日期
-            mature = sum(
-                lot["remain"]
-                for lot in lots
-                if lot["remain"] > 0 and (today - lot["confirm"]).days >= 7
-            )
-            if abs(mature - round(mature)) < 1e-9:
-                mature_str = str(int(round(mature)))
-            else:
-                mature_str = str(round(mature, 2))
-            results[orig_i] = mature_str
-            row[mature_i] = mature_str
+            lots = self._lots_from_flows([ev for ev in tagged if ev[1] <= seq], today)
+            bucket_vals = self._bucket_remaining_by_tier(lots, today, self.redeem_tiers)
+            results[orig_i] = bucket_vals
+            for j, ci in enumerate(redeem_cols):
+                if ci < len(row):
+                    row[ci] = bucket_vals[j] if j < len(bucket_vals) else "-"
 
         n_visible = len(self.rows)
         for i, row_widgets in enumerate(self.rows):
             if i >= len(self._full_rows_data):
                 break
-            val = results.get(i, self._full_rows_data[i][mature_i])
-            self._set_entry_value(row_widgets[mature_i], val, readonly=True)
+            vals = results.get(i)
+            if vals is None:
+                vals = [
+                    self._full_rows_data[i][ci] if ci < len(self._full_rows_data[i]) else "-"
+                    for ci in redeem_cols
+                ]
+            for j, ci in enumerate(redeem_cols):
+                if ci < len(row_widgets):
+                    self._set_entry_value(
+                        row_widgets[ci],
+                        vals[j] if j < len(vals) else "-",
+                        readonly=True,
+                    )
 
         if self._history_collapsed and self._hidden_rows_data is not None:
             self._hidden_rows_data = [
                 list(r) for r in self._full_rows_data[n_visible:]
             ]
+
+        # 当前持仓为 0 的赎回档隐藏（避免空列占位）
+        if not self._filter_lock:
+            visible_tiers = self._filter_nonzero_tiers(final_lots, today)
+            old_labels = [t["label"] for t in self.redeem_tiers]
+            new_labels = [t["label"] for t in visible_tiers]
+            if old_labels != new_labels:
+                self._filter_lock = True
+                try:
+                    self.apply_redeem_tiers(visible_tiers)
+                finally:
+                    self._filter_lock = False
 
     def save_data(self):
         self._sync_full_from_ui()
@@ -995,6 +1258,7 @@ class TradeSheet(tk.Frame):
                 "fund_name": self.top_slot2.get(),
                 "real_time_price": self._format_3dp(self.top_slot4.get()),
                 "is_qdii": bool(self.is_qdii_var.get()),
+                "has_redeem_shares_col": True,
             },
             "rows": self._full_rows_data,
         }
@@ -1133,12 +1397,10 @@ class TradeSheet(tk.Frame):
             self._refitting = False
 
     def _normalize_row(self, row):
-        """Pad/migrate legacy rows up to current 10-col header width."""
+        """Pad/migrate legacy rows to BASE + 当前赎回分档列数。"""
         if not isinstance(row, list):
             return None
         expected = len(self.headers)
-        if len(row) > expected:
-            return None
         out = list(row)
 
         def _buy_from_credited(cols):
@@ -1146,27 +1408,140 @@ class TradeSheet(tk.Frame):
                 return str(cols[3]).strip()
             return "0"
 
-        # 9 列旧格式：…, 至今涨幅, 卖出份额, 满7日剩余 → 在卖出前插入买入份额
-        if len(out) == 9:
+        # 旧 8 列：…涨幅, 卖出 → 插入买入
+        if len(out) == 8:
             out = out[:7] + [_buy_from_credited(out)] + out[7:]
-        # 8 列旧格式：…, 至今涨幅, 卖出份额 → 插入买入 + 补满7日
-        elif len(out) == 8:
-            out = out[:7] + [_buy_from_credited(out)] + out[7:] + ["-"]
-        else:
-            while len(out) < expected:
-                if len(out) == 6:
-                    out.append("-")  # 至今涨幅
-                elif len(out) == 7:
-                    out.append(_buy_from_credited(out))  # 买入份额
-                elif len(out) == 8:
-                    out.append("0")  # 卖出份额
-                else:
-                    out.append("-")  # 满7日剩余
+        # 旧 9 列（无买入 + 满7日）：插买入并丢掉满7日。仅在读入「赎回份额」列之前的文件时使用
+        elif len(out) == 9 and self._legacy_without_redeem_col and expected != 9:
+            out = out[:7] + [_buy_from_credited(out)] + [out[7]]
 
-        # 申购成本/份统一 3 位小数
+        if self._legacy_without_redeem_col:
+            # 前 9 列到卖出份额；其后是旧分段展示值。插入赎回份额 0 后丢掉旧尾列
+            if len(out) >= PRE_REDEEM_COL_BASE:
+                out = out[:PRE_REDEEM_COL_BASE] + ["0"]
+        elif len(out) > BASE_COL_COUNT:
+            out = out[:BASE_COL_COUNT]
+
+        while len(out) < BASE_COL_COUNT:
+            if len(out) == 6:
+                out.append("-")
+            elif len(out) == 7:
+                out.append(_buy_from_credited(out))
+            elif len(out) in (8, 9):
+                out.append("0")
+            else:
+                out.append("-")
+
+        while len(out) < expected:
+            out.append("-")
+        if len(out) > expected:
+            out = out[:expected]
+
         if len(out) > 4:
             out[4] = self._format_cost_per_share(out[4])
         return out
+
+    def apply_redeem_tiers(self, tiers):
+        """按赎回分段重建表头与尾列（不丢买入/卖出等基础数据）。tiers 可为空（隐藏全部赎回列）。"""
+        if tiers is None:
+            tiers = [dict(t) for t in xalpha_tool.DEFAULT_REDEEM_TIERS]
+        else:
+            tiers = [dict(t) for t in tiers]
+
+        new_headers = self._compose_headers(tiers)
+        if new_headers == list(self.headers):
+            self.redeem_tiers = tiers
+            return False
+
+        was_batch = self._batch_loading
+        self._batch_loading = True
+        try:
+            self._sync_full_from_ui()
+            n_visible = len(self.rows)
+            collapsed = bool(self._history_collapsed)
+
+            def _trim(rows):
+                trimmed = []
+                for r in rows:
+                    base = list(r)[:BASE_COL_COUNT]
+                    while len(base) < BASE_COL_COUNT:
+                        base.append("-")
+                    base.extend(["-"] * len(tiers))
+                    trimmed.append(base)
+                return trimmed
+
+            full = _trim(self._full_rows_data)
+
+            self.redeem_tiers = tiers
+            self.headers = new_headers
+            self._refresh_col_indices()
+
+            self._clear_data_rows()
+            self.draw_table()
+
+            if collapsed:
+                visible_data = full[:n_visible]
+                self._hidden_rows_data = full[n_visible:]
+                self._history_collapsed = True
+                self._full_rows_data = visible_data + self._hidden_rows_data
+            else:
+                visible_data = full
+                self._hidden_rows_data = []
+                self._history_collapsed = False
+                self._full_rows_data = full
+
+            for row in visible_data:
+                prefill = dict(zip(self.headers, row))
+                self.add_row_on_bottom(prefill=prefill)
+        finally:
+            self._batch_loading = was_batch
+
+        self.render_action_buttons()
+        self._recompute_lot_state()
+        if not self._batch_loading:
+            self.save_data()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._notify_window_fit()
+        return True
+
+    def reload_redeem_tiers_async(self):
+        """后台拉取 feeinfo / 申购费率并换列（不卡 UI）。"""
+        code = str(self.sheet_name)
+        if not (code.isdigit() and len(code) == 6):
+            return
+        if self._tiers_loading:
+            return
+        self._tiers_loading = True
+
+        def worker():
+            tiers = None
+            rate = None
+            try:
+                tiers = xalpha_tool.get_redeem_tiers(code)
+                rate = xalpha_tool.get_subscribe_actual_rate(code)
+            except Exception as e:
+                print(f"拉取费率信息失败: {e}")
+
+            def finish():
+                self._tiers_loading = False
+                if not self.winfo_exists():
+                    return
+                if rate is not None:
+                    self._subscribe_actual_rate = rate
+                if tiers:
+                    self._all_redeem_tiers = [dict(t) for t in tiers]
+                    # 先套全部分档，_recompute_lot_state 会去掉当前为 0 的档
+                    self.apply_redeem_tiers(tiers)
+                elif self._subscribe_actual_rate is not None:
+                    # 仅刷新申购金额标题上的费率
+                    self.apply_redeem_tiers(self.redeem_tiers)
+
+            try:
+                self.after(0, finish)
+            except Exception:
+                self._tiers_loading = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _extract_visible_rows_data(self):
         rows_data = []
@@ -1268,11 +1643,17 @@ class TradeSheet(tk.Frame):
                     top_info = saved_data.get("top_info", {})
                     rows_data = saved_data.get("rows", [])
 
+                self._legacy_without_redeem_col = not bool(
+                    top_info.get("has_redeem_shares_col")
+                )
                 valid_rows = []
-                for row in rows_data:
-                    normalized = self._normalize_row(row)
-                    if normalized is not None:
-                        valid_rows.append(normalized)
+                try:
+                    for row in rows_data:
+                        normalized = self._normalize_row(row)
+                        if normalized is not None:
+                            valid_rows.append(normalized)
+                finally:
+                    self._legacy_without_redeem_col = False
                 self._full_rows_data = valid_rows
 
                 fund_name = top_info.get("fund_name", "") or ""

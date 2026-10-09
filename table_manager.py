@@ -6,7 +6,7 @@ from tkinter import ttk
 from tkinter import simpledialog
 from tkcalendar import DateEntry
 
-from trade_sheet import TradeSheet
+from trade_sheet import TradeSheet, BASE_HEADERS
 import xalpha_tool
 
 class TableManager(tk.Tk):
@@ -15,24 +15,11 @@ class TableManager(tk.Tk):
         
         # App title
         self.title("LOF套利记账本")
-        self.geometry("1400x600")
-        self.minsize(1300, 500)
+        self.geometry("1100x600")
+        self.minsize(980, 500)
         
-        # create headers
-        self.headers = [
-            "日期",
-            "净值",
-            "申购金额",
-            "到账份额",
-            "申购成本/份",
-            "预估利润",
-            "至今涨幅",
-            "买入份额",
-            "卖出份额",
-            "满7日剩余",
-        ]
-
-        # redemption: 赎回 in share
+        # 基础表头；赎回分段列由 TradeSheet 按基金 feeinfo 动态追加
+        self.headers = list(BASE_HEADERS)
 
         # 修改顺序
         # 创建notebook
@@ -131,7 +118,8 @@ class TableManager(tk.Tk):
                 # valid fund code, write to the corresponding unit
                 sheet.top_slot2.delete(0, tk.END)
                 sheet.top_slot2.insert(0, fund_name)
-            
+
+                sheet.reload_redeem_tiers_async()
                 sheet.update_price()
                 sheet.update_profits()
 
@@ -183,14 +171,31 @@ class TableManager(tk.Tk):
             print("No valid sheets found — creating a new one.")
             self.add_new_sheet()
        
-    def on_tab_change(self, event):
-        # 固定最小窗口；表格在 sheet 内滚动，不再随行数无限拉高
-        self.minsize(1300, 500)
+    def _active_sheet(self):
+        tab = self.notebook.select()
+        if not tab:
+            return None
+        name = self.notebook.tab(tab, "text")
+        return self.sheets.get(name)
+
+    def fit_window_to_active_sheet(self):
+        """按表格需求宽度调整窗口（赎回列隐藏 / 顶栏收紧后应收窄）。"""
+        sheet = self._active_sheet()
+        need_w = 980
+        if sheet is not None and hasattr(sheet, "preferred_window_width"):
+            need_w = int(sheet.preferred_window_width())
+        need_w = max(980, min(need_w, 1800))
+        self.minsize(980, 500)
         self.update_idletasks()
-        width = max(self.winfo_width(), 1300)
-        height = max(self.winfo_height(), 500)
-        if self.winfo_width() < 1300 or self.winfo_height() < 500:
-            self.geometry(f"{width}x{height}")
+        cur_w = self.winfo_width()
+        cur_h = max(self.winfo_height(), 500)
+        # 对齐到表格宽度：偏窄拉宽，偏宽（多出 >40px）收窄
+        if cur_w < need_w or cur_w > need_w + 40:
+            self.geometry(f"{need_w}x{cur_h}")
+
+    def on_tab_change(self, event):
+        # 表格在 sheet 内滚动；宽度随当前赎回列数自适应
+        self.fit_window_to_active_sheet()
 
     def delete_current_sheet(self):
         # 获取当前选中的标签页
