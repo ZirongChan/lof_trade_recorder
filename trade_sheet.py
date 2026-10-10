@@ -928,7 +928,7 @@ class TradeSheet(tk.Frame):
         """启动后补齐能算却未填入的净值/到账/成本（不覆盖已有值所在的完整行）。"""
         if not self.winfo_exists():
             return
-        self.refresh_derived_metrics(only_missing=True)
+        self.refresh_derived_metrics(only_missing=True, persist=False)
 
     def _apply_subscribe_job_results(self, results):
         for job, calc in results:
@@ -951,9 +951,9 @@ class TradeSheet(tk.Frame):
             ):
                 self._apply_calc_to_row_data(self._hidden_rows_data[job["index"]], calc)
 
-    def refresh_derived_metrics(self, only_missing=False):
-        """利润/涨幅本地即刷；申购重算后台一次拉齐（同基金只请求一次）。
-        only_missing=True：只补净值/到账/成本仍为空的行（启动用）；按钮刷新传 False 重算全部有申购的行。
+    def refresh_derived_metrics(self, only_missing=True, persist=True):
+        """利润/涨幅/分段本地即刷；申购默认只补空字段（同基金只请求一次）。
+        only_missing=False 时重算全部有申购金额的行（改公式后纠错用）。
         """
         if self._refresh_busy:
             return
@@ -962,20 +962,18 @@ class TradeSheet(tk.Frame):
         self._reformat_all_cost_displays()
 
         jobs = self._collect_subscribe_jobs(only_missing=only_missing)
-        # 先本地刷一遍（含金额=0 清空后的利润/满7日）
+        # 先本地刷一遍（含金额=0 清空后的利润/分段）
         self.update_profits()
         self._recompute_lot_state()
         if not jobs:
-            # 启动补缺若无需联网，不强制写盘
-            if not self._batch_loading and not only_missing:
+            if not self._batch_loading and persist:
                 self.save_data()
             return
 
         self._refresh_busy = True
         self._refresh_gen += 1
         gen = self._refresh_gen
-        if not only_missing:
-            self._set_refresh_button_busy(True)
+        self._set_refresh_button_busy(True)
         fund_code = self.sheet_name
 
         def worker():
@@ -999,12 +997,11 @@ class TradeSheet(tk.Frame):
                     self._apply_subscribe_job_results(results)
                     self.update_profits()
                     self._recompute_lot_state()
-                    if not self._batch_loading:
+                    if not self._batch_loading and persist:
                         self.save_data()
                 finally:
                     self._refresh_busy = False
-                    if not only_missing:
-                        self._set_refresh_button_busy(False)
+                    self._set_refresh_button_busy(False)
 
             self.after(0, finish)
 
@@ -1224,7 +1221,7 @@ class TradeSheet(tk.Frame):
         return lots
 
     def _recompute_lot_state(self):
-        """FIFO：卖出 T 日扣、赎回 T+x 确认后扣；赎回分段相对今天分档；零份额档不展示。"""
+        """FIFO 一次重放全部流水得到当前持仓；分段列只写在日期最晚的那一行。"""
         self._sync_full_from_ui()
         if not self._full_rows_data:
             return
@@ -1243,50 +1240,44 @@ class TradeSheet(tk.Frame):
             )
         )
 
-        parsed = []
-        for orig_i, row in indexed:
+        tagged = []
+        last_valid_orig = None
+        for seq, (orig_i, row) in enumerate(indexed):
             normalized = self._normalize_row(row)
             if normalized is None:
-                parsed.append({"orig_i": orig_i, "row": row, "as_of": None, "flows": []})
                 continue
             row[:] = normalized
             as_of = self._parse_row_date(row)
-            flows = self._share_flows_for_row(row, as_of, confirm_n) if as_of else []
-            parsed.append({"orig_i": orig_i, "row": row, "as_of": as_of, "flows": flows})
-
-        tagged = []
-        for seq, item in enumerate(parsed):
-            for effective, phase, shares, source in item["flows"]:
+            for ci in redeem_cols:
+                if ci < len(row):
+                    row[ci] = "-"
+            if as_of is None:
+                continue
+            last_valid_orig = orig_i
+            for effective, phase, shares, source in self._share_flows_for_row(
+                row, as_of, confirm_n
+            ):
                 tagged.append((effective, seq, phase, shares, source))
 
-        results = {}
         final_lots = self._lots_from_flows(tagged, today)
-        for seq, item in enumerate(parsed):
-            orig_i = item["orig_i"]
-            row = item["row"]
-            if item["as_of"] is None:
-                results[orig_i] = list(blank)
-                for ci in redeem_cols:
-                    if ci < len(row):
-                        row[ci] = "-"
-                continue
-            lots = self._lots_from_flows([ev for ev in tagged if ev[1] <= seq], today)
-            bucket_vals = self._bucket_remaining_by_tier(lots, today, self.redeem_tiers)
-            results[orig_i] = bucket_vals
+        bucket_vals = self._bucket_remaining_by_tier(
+            final_lots, today, self.redeem_tiers
+        )
+        if last_valid_orig is not None:
+            row = self._full_rows_data[last_valid_orig]
             for j, ci in enumerate(redeem_cols):
                 if ci < len(row):
                     row[ci] = bucket_vals[j] if j < len(bucket_vals) else "-"
 
         n_visible = len(self.rows)
+        # 界面：分段写在「日期最晚」那一行；若该行被折进「更多」，则临时显示在表顶
+        show_on = last_valid_orig
+        if show_on is not None and show_on >= n_visible and n_visible > 0:
+            show_on = 0
         for i, row_widgets in enumerate(self.rows):
             if i >= len(self._full_rows_data):
                 break
-            vals = results.get(i)
-            if vals is None:
-                vals = [
-                    self._full_rows_data[i][ci] if ci < len(self._full_rows_data[i]) else "-"
-                    for ci in redeem_cols
-                ]
+            vals = bucket_vals if (show_on is not None and i == show_on) else blank
             for j, ci in enumerate(redeem_cols):
                 if ci < len(row_widgets):
                     self._set_entry_value(
