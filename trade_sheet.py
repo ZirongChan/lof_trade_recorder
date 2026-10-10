@@ -117,9 +117,10 @@ class TradeSheet(tk.Frame):
         # Stagger price refresh across tabs to avoid a startup request stampede
         price_delay = 80 + (sum(ord(c) for c in sheet_name) % 17) * 120
         self.after(price_delay, self.update_price)
-        # 有 6 位代码时后台拉赎回分段并换列
+        # 有 6 位代码时后台拉赎回分段并换列；再补一轮「能算却未填」的申购字段
         if str(sheet_name).isdigit() and len(str(sheet_name)) == 6:
             self.after(price_delay + 40, self.reload_redeem_tiers_async)
+            self.after(price_delay + 100, self._startup_fill_missing)
 
     def _compose_headers(self, redeem_tiers):
         """基础列 + 赎回档；申购金额标题附申购实际费率。"""
@@ -454,7 +455,9 @@ class TradeSheet(tk.Frame):
 
     def add_row_on_top(self, prefill=None):
         if prefill is None:
-            prefill = {"日期": self.latest_trading_day().strftime("%Y-%m-%d")}
+            prefill = {
+                "日期": self.default_date_for_top_insert().strftime("%Y-%m-%d")
+            }
 
         # Shift existing data rows down by one grid index
         for i, existing_row in enumerate(self.rows):
@@ -675,6 +678,21 @@ class TradeSheet(tk.Frame):
         text = str(value).strip() if value is not None else ""
         return text in ("", "-", "0")
 
+    @staticmethod
+    def _is_blank_cell(value):
+        text = str(value).strip() if value is not None else ""
+        return text in ("", "-", "None")
+
+    def _subscribe_fields_incomplete(self, nav, shares, cost, money):
+        """申购金额>0 时净值/到账/成本任一空；金额≤0 时仅缺净值（供涨幅）也算未填完。"""
+        if money <= 0:
+            return self._is_blank_cell(nav)
+        return (
+            self._is_blank_cell(nav)
+            or self._is_blank_cell(shares)
+            or self._is_blank_cell(cost)
+        )
+
     def _maybe_fill_buy_shares(self, current_buy, suggested):
         """申购成功后：仅当买入份额为空/0 时用到账份额预填，不覆盖已有买入。"""
         if suggested is None:
@@ -823,8 +841,8 @@ class TradeSheet(tk.Frame):
         except Exception:
             pass
 
-    def _collect_subscribe_jobs(self):
-        """收集需要联网重算的行（申购金额>0）。金额≤0 只做本地清空。"""
+    def _collect_subscribe_jobs(self, only_missing=False):
+        """收集需要联网重算的行。only_missing=True 时只收「能算却未填」的行。"""
         jobs = []
         fund_code = self.sheet_name
         if len(fund_code) != 6 or not fund_code.isdigit():
@@ -836,9 +854,25 @@ class TradeSheet(tk.Frame):
                 buy_money = self._parse_buy_money(row[2].get())
             except ValueError:
                 continue
+            nav = row[1].get() if len(row) > 1 else ""
+            shares = row[3].get() if len(row) > 3 else ""
+            cost = row[4].get() if len(row) > 4 else ""
             if buy_money <= 0:
                 calc = self._calc_subscription_fields_local_clear(buy_money)
                 self._apply_calc_to_row_widgets(row, calc)
+                if only_missing and date_str and self._is_blank_cell(nav):
+                    jobs.append(
+                        {
+                            "kind": "visible",
+                            "index": i,
+                            "date": date_str,
+                            "money": 0.0,
+                        }
+                    )
+                continue
+            if only_missing and not self._subscribe_fields_incomplete(
+                nav, shares, cost, buy_money
+            ):
                 continue
             jobs.append(
                 {
@@ -859,10 +893,26 @@ class TradeSheet(tk.Frame):
                 buy_money = self._parse_buy_money(str(row[2]))
             except ValueError:
                 continue
+            nav = row[1] if len(row) > 1 else ""
+            shares = row[3] if len(row) > 3 else ""
+            cost = row[4] if len(row) > 4 else ""
             if buy_money <= 0:
                 self._apply_calc_to_row_data(
                     row, self._calc_subscription_fields_local_clear(buy_money)
                 )
+                if only_missing and date_str and self._is_blank_cell(nav):
+                    jobs.append(
+                        {
+                            "kind": "hidden",
+                            "index": i,
+                            "date": date_str,
+                            "money": 0.0,
+                        }
+                    )
+                continue
+            if only_missing and not self._subscribe_fields_incomplete(
+                nav, shares, cost, buy_money
+            ):
                 continue
             jobs.append(
                 {
@@ -873,6 +923,12 @@ class TradeSheet(tk.Frame):
                 }
             )
         return jobs
+
+    def _startup_fill_missing(self):
+        """启动后补齐能算却未填入的净值/到账/成本（不覆盖已有值所在的完整行）。"""
+        if not self.winfo_exists():
+            return
+        self.refresh_derived_metrics(only_missing=True)
 
     def _apply_subscribe_job_results(self, results):
         for job, calc in results:
@@ -895,27 +951,31 @@ class TradeSheet(tk.Frame):
             ):
                 self._apply_calc_to_row_data(self._hidden_rows_data[job["index"]], calc)
 
-    def refresh_derived_metrics(self):
-        """利润/涨幅本地即刷；缺净值的申购重算后台一次拉齐（同基金只请求一次）。"""
+    def refresh_derived_metrics(self, only_missing=False):
+        """利润/涨幅本地即刷；申购重算后台一次拉齐（同基金只请求一次）。
+        only_missing=True：只补净值/到账/成本仍为空的行（启动用）；按钮刷新传 False 重算全部有申购的行。
+        """
         if self._refresh_busy:
             return
 
         # 成本 3 位小数：本地立刻改显示，不依赖后台重算
         self._reformat_all_cost_displays()
 
-        jobs = self._collect_subscribe_jobs()
+        jobs = self._collect_subscribe_jobs(only_missing=only_missing)
         # 先本地刷一遍（含金额=0 清空后的利润/满7日）
         self.update_profits()
         self._recompute_lot_state()
         if not jobs:
-            if not self._batch_loading:
+            # 启动补缺若无需联网，不强制写盘
+            if not self._batch_loading and not only_missing:
                 self.save_data()
             return
 
         self._refresh_busy = True
         self._refresh_gen += 1
         gen = self._refresh_gen
-        self._set_refresh_button_busy(True)
+        if not only_missing:
+            self._set_refresh_button_busy(True)
         fund_code = self.sheet_name
 
         def worker():
@@ -943,7 +1003,8 @@ class TradeSheet(tk.Frame):
                         self.save_data()
                 finally:
                     self._refresh_busy = False
-                    self._set_refresh_button_busy(False)
+                    if not only_missing:
+                        self._set_refresh_button_busy(False)
 
             self.after(0, finish)
 
@@ -1273,6 +1334,38 @@ class TradeSheet(tk.Frame):
         while d.weekday() >= 5:
             d -= timedelta(days=1)
         return d
+
+    @staticmethod
+    def upcoming_trading_day(from_date=None):
+        """即将到来的交易日：当天若为工作日则用之，否则前进到下周一（不含法定节假日）。"""
+        d = from_date or datetime.now().date()
+        while d.weekday() >= 5:
+            d += timedelta(days=1)
+        return d
+
+    def _max_existing_row_date(self):
+        """已有行（含折叠隐藏）中的最晚日期；没有则 None。"""
+        self._sync_full_from_ui()
+        best = None
+        for row in self._full_rows_data:
+            d = self._parse_row_date(row)
+            if d is not None and (best is None or d > best):
+                best = d
+        return best
+
+    def default_date_for_top_insert(self):
+        """
+        顶部插入默认日期：已有条目最近日期之后的「当前最新」交易日。
+        - 先取即将到来的交易日（周末则进到下周一）；
+        - 若不晚于已有最近日期，则改为该日期之后的第 1 个交易日。
+        """
+        upcoming = self.upcoming_trading_day()
+        max_existing = self._max_existing_row_date()
+        if max_existing is None:
+            return upcoming
+        if upcoming > max_existing:
+            return upcoming
+        return self.add_trading_days(max_existing, 1)
 
     @staticmethod
     def _parse_row_date(row_data):

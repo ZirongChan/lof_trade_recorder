@@ -128,7 +128,7 @@ def _fee_rates(fund):
 
 
 def get_subscribe_actual_rate(code):
-    """记账本申购采用的实际费率（%），如 0.12；失败返回 None。"""
+    """标题展示用：实际佣金费率（%），如 0.12；失败返回 None。"""
     try:
         if not code or not str(code).isdigit() or len(str(code)) != 6:
             return None
@@ -142,7 +142,8 @@ def subscribe_xalpha(code, money_amount, date):
     try:
         fund = get_fund(code)
         declared_rate, _actual_rate = _fee_rates(fund)
-        money_to_buy = money_amount * (1 - declared_rate * 0.01 * 0.9)
+        # 份额口径：按公告费率外扣后的净额
+        money_to_buy = money_amount / (1 + declared_rate * 0.01)
         res = fund.shengou(value=money_to_buy, date=date)
         print(res)
     except Exception:
@@ -150,6 +151,13 @@ def subscribe_xalpha(code, money_amount, date):
 
 
 def subscribe(code, money_amount, date):
+    """
+    对齐常见券商确认单（如华宝）：
+      到账份额   = floor( 申购金额 / (1 + 公告费率) / 净值 )   ← 外扣用公告档
+      成交金额   = 到账份额 × 净值
+      佣金       = 成交金额 × 实际费率（多为公告档的 1 折）
+      成本/份    = (成交金额 + 佣金) / 到账份额
+    """
     try:
         fund = get_fund(code)
         declared_rate, actual_rate = _fee_rates(fund)
@@ -158,14 +166,17 @@ def subscribe(code, money_amount, date):
         if net_val_to_buy is None:
             return None
 
-        money_to_buy = money_amount * (1 - declared_rate * 0.01)
-        share_amount_bought = floor(money_to_buy / net_val_to_buy)
+        declared = declared_rate * 0.01
+        if declared <= -1:
+            return None
+        net_money = money_amount / (1 + declared)
+        share_amount_bought = floor(net_money / net_val_to_buy)
         if share_amount_bought <= 0:
             return None
 
+        # 成交金额 = 份额 × 净值；佣金按折扣后实际费率
         money_for_shares = share_amount_bought * net_val_to_buy
         fee = money_for_shares * actual_rate * 0.01
-
         total_money_spent = round(money_for_shares + fee + 0.005, 2)
         fee = round(fee + 0.005, 2)
         # 申购成本/份固定保留 3 位小数（+0.0005 作四舍五入）
@@ -177,6 +188,7 @@ def subscribe(code, money_amount, date):
             "total_money": float(total_money_spent),
             "cost_per_share": f"{cost_per_share:.3f}",
             "net_value": float(net_val_to_buy),
+            "deal_amount": round(money_for_shares + 1e-9, 2),
         }
     except Exception:
         return None
